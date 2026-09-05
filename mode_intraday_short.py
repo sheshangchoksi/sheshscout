@@ -179,7 +179,7 @@ def render() -> None:
     do_scan, resume_scan, checkpoint, _sig = sc.render_scan_trigger(
         MODE_KEY, stocks_to_scan, f"🔍 SCAN {len(stocks_to_scan)} STOCKS FOR SHORT SETUPS")
 
-    if do_scan:
+    if do_scan or resume_scan:
         sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint)
 
     _render_results()
