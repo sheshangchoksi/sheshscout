@@ -359,24 +359,30 @@ def render_scan_trigger(mode_key: str, stocks_to_scan: list[dict], label: str):
         checkpoint and checkpoint.get("next_index", 0) < len(stocks_to_scan)
     )
 
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        do_scan = st.button(label, type="primary", width="stretch",
-                             disabled=(len(stocks_to_scan) == 0), key=sskey(mode_key, "scan_btn"))
-    with col2:
-        # Rendered into a placeholder (not drawn directly) so run_scan()
-        # can erase it later in this same script pass if a leg finishes
-        # scanning inside this very call -- otherwise a "Resume (6/7)"
-        # button drawn here at the top would keep showing on screen even
-        # after the scan reports complete lower down the page, since
-        # Streamlit never retroactively removes an already-drawn widget.
-        resume_placeholder = st.empty()
-        resume_scan = False
-        if resume_available:
-            resume_scan = resume_placeholder.button(
-                f"▶ Resume ({checkpoint['next_index']}/{len(stocks_to_scan)})",
-                width="stretch", key=sskey(mode_key, "resume_btn"),
-            )
+    # The main SCAN button and the Resume button are two independent rows,
+    # not a shared st.columns() row. Splitting them into columns caused two
+    # separate visual bugs: (1) the SCAN button was permanently ~25%
+    # narrower than every other element on the page to reserve space for
+    # a Resume button that mostly wasn't there, and (2) even after fixing
+    # that for the no-checkpoint case, the *last* leg of a scan still
+    # renders with resume_available=True (checkpoint from the previous leg
+    # hasn't been cleared yet at render time), so the column split -- and
+    # its leftover empty gap -- reappeared for exactly one frame right as
+    # the scan finished. Two always-full-width, independent rows sidestep
+    # both issues entirely.
+    do_scan = st.button(label, type="primary", width="stretch",
+                         disabled=(len(stocks_to_scan) == 0), key=sskey(mode_key, "scan_btn"))
+
+    # Always create the placeholder (even when unused) so run_scan() can
+    # unconditionally erase it later in this same pass if the scan
+    # finishes inside this very call.
+    resume_placeholder = st.empty()
+    resume_scan = False
+    if resume_available:
+        resume_scan = resume_placeholder.button(
+            f"▶ Resume ({checkpoint['next_index']}/{len(stocks_to_scan)})",
+            width="stretch", key=sskey(mode_key, "resume_btn"),
+        )
 
     # Auto-continue: a previous leg that paused mid-scan sets this flag and
     # triggers an immediate rerun. On that rerun nothing was clicked, so we
