@@ -109,6 +109,18 @@ _dead_lock = threading.Lock()
 _dead_symbols: dict[str, float] = {}
 _DEAD_TTL_S = 6 * 3600
 
+# Separate, much shorter-lived registry for "no intraday trades today, but
+# it does have daily history" -- i.e. genuinely listed, just illiquid right
+# now (common across NSE's SME-platform tail). This is NOT the same thing
+# as delisted: conflating the two into one 6h registry meant thin stocks
+# got retried, and re-logged yfinance's own failure noise, on every single
+# scan of the day. A short TTL here stops that within-day repeat hammering
+# while still giving the stock a few more chances later in the session in
+# case it starts trading.
+_quiet_lock = threading.Lock()
+_quiet_symbols: dict[str, float] = {}
+_QUIET_TTL_S = 45 * 60
+
 
 def is_known_dead(symbol: str) -> bool:
     with _dead_lock:
@@ -125,6 +137,25 @@ def is_known_dead(symbol: str) -> bool:
 def mark_dead_symbol(symbol: str) -> None:
     with _dead_lock:
         _dead_symbols[symbol] = time.time()
+
+
+def is_quiet_today(symbol: str) -> bool:
+    """True if this symbol had no intraday activity on a recent attempt
+    (within the last ~45 min), even though it isn't considered dead."""
+    with _quiet_lock:
+        ts = _quiet_symbols.get(symbol)
+    if ts is None:
+        return False
+    if (time.time() - ts) > _QUIET_TTL_S:
+        with _quiet_lock:
+            _quiet_symbols.pop(symbol, None)
+        return False
+    return True
+
+
+def mark_quiet_today(symbol: str) -> None:
+    with _quiet_lock:
+        _quiet_symbols[symbol] = time.time()
 
 
 # --------------------------------------------------------------------- #
@@ -290,11 +321,16 @@ def render_rate_limit_controls(mode_key: str) -> dict:
                                           "concurrent scraping, especially from shared cloud IPs.")
     delay = st.sidebar.slider("Delay between batches (s)", 0.0, 3.0, 0.4, 0.1, key=sskey(mode_key, "delay"))
     retries = st.sidebar.slider("Retries per symbol", 1, 5, 3, 1, key=sskey(mode_key, "retries"))
-    time_budget = st.sidebar.slider("Time budget per scan run (s)", 30, 280, 180, 10, key=sskey(mode_key, "time_budget"),
-                                     help="Streamlit Cloud's free tier will kill very long-running "
-                                          "requests — the scan checkpoints and stops before that happens; "
-                                          "click Resume to continue.")
-    return {"max_workers": max_workers, "delay": delay, "retries": retries, "time_budget": time_budget}
+    time_budget = st.sidebar.slider("Time per leg (s)", 20, 120, 60, 10, key=sskey(mode_key, "time_budget"),
+                                     help="The scan runs in short 'legs' rather than one long call — after "
+                                          "each leg it saves progress and, if Auto-continue is on below, "
+                                          "immediately keeps going on its own.")
+    auto_continue = st.sidebar.checkbox("Auto-continue until done", value=True, key=sskey(mode_key, "auto_continue"),
+                                         help="Off: you'll need to click Resume yourself after each leg. "
+                                              "On: the scan keeps going leg after leg with no clicking, "
+                                              "until it's fully done — uncheck mid-scan to pause it.")
+    return {"max_workers": max_workers, "delay": delay, "retries": retries, "time_budget": time_budget,
+            "auto_continue": auto_continue}
 
 
 # --------------------------------------------------------------------- #
@@ -308,26 +344,53 @@ def render_scan_trigger(mode_key: str, stocks_to_scan: list[dict], label: str):
     st.markdown("---")
     checkpoint = get_state(mode_key, "checkpoint")
     sig = _scan_signature(stocks_to_scan)
+
+    if checkpoint and checkpoint.get("sig") != sig:
+        # The scan universe/settings changed since the last paused/
+        # incomplete run -- that checkpoint no longer applies to anything
+        # resumable. Discard it instead of leaving it stranded in session
+        # state forever (and clear any pending auto-continue flag with it,
+        # so a stale flag can never silently fire against unrelated state).
+        set_state(mode_key, "checkpoint", None)
+        set_state(mode_key, "auto_pending", False)
+        checkpoint = None
+
     resume_available = bool(
-        checkpoint and checkpoint.get("sig") == sig and checkpoint.get("next_index", 0) < len(stocks_to_scan)
+        checkpoint and checkpoint.get("next_index", 0) < len(stocks_to_scan)
     )
 
     col1, col2 = st.columns([3, 1])
     with col1:
-        do_scan = st.button(label, type="primary", use_container_width=True,
+        do_scan = st.button(label, type="primary", width="stretch",
                              disabled=(len(stocks_to_scan) == 0), key=sskey(mode_key, "scan_btn"))
     with col2:
+        # Rendered into a placeholder (not drawn directly) so run_scan()
+        # can erase it later in this same script pass if a leg finishes
+        # scanning inside this very call -- otherwise a "Resume (6/7)"
+        # button drawn here at the top would keep showing on screen even
+        # after the scan reports complete lower down the page, since
+        # Streamlit never retroactively removes an already-drawn widget.
+        resume_placeholder = st.empty()
         resume_scan = False
         if resume_available:
-            resume_scan = st.button(
+            resume_scan = resume_placeholder.button(
                 f"▶ Resume ({checkpoint['next_index']}/{len(stocks_to_scan)})",
-                use_container_width=True, key=sskey(mode_key, "resume_btn"),
+                width="stretch", key=sskey(mode_key, "resume_btn"),
             )
-    return do_scan, resume_scan, checkpoint, sig
+
+    # Auto-continue: a previous leg that paused mid-scan sets this flag and
+    # triggers an immediate rerun. On that rerun nothing was clicked, so we
+    # treat it as an implicit Resume rather than requiring the user to.
+    if resume_available and get_state(mode_key, "auto_pending", False):
+        set_state(mode_key, "auto_pending", False)
+        resume_scan = True
+
+    return do_scan, resume_scan, checkpoint, sig, resume_placeholder
 
 
 def run_scan(mode_key: str, stocks_to_scan: list[dict], fetch_and_analyze: Callable[[dict], tuple],
-             rate_cfg: dict, resume_scan: bool, checkpoint: Optional[dict]) -> None:
+             rate_cfg: dict, resume_scan: bool, checkpoint: Optional[dict],
+             resume_placeholder: Optional["st.delta_generator.DeltaGenerator"] = None) -> None:
     """Runs `fetch_and_analyze(rec) -> (status, analysis)` over
     `stocks_to_scan` in small parallel batches, checkpointing progress into
     per-session state after every batch so a time-budget stop, a Streamlit
@@ -398,14 +461,39 @@ def run_scan(mode_key: str, stocks_to_scan: list[dict], fetch_and_analyze: Calla
     except Exception as e:  # last-resort guard: never let a scan crash the app
         st.error(f"Scan hit an unexpected error and stopped safely at {pos}/{total}: {e}")
         stopped_early = True
+        hard_error = True
+    else:
+        hard_error = False
 
     set_state(mode_key, "results", results)
 
-    if stopped_early or pos < total:
-        st.warning(f"⏸ Paused after {pos}/{total} stocks (time budget or error). Click **Resume** above to continue.")
+    if hard_error:
+        # Never auto-rerun on a genuine error -- that would just loop the
+        # same failure. Leave the manual Resume button (still accurate --
+        # checkpoint reflects real progress up to the error) for the user.
+        pass
+    elif stopped_early or pos < total:
+        if rate_cfg.get("auto_continue", True):
+            status.caption(
+                f"Processed {pos}/{total} · ✅ {len(results)} matches · "
+                f"⏭ {filtered_count} filtered · ⚠️ {failed_count} failed · continuing automatically…"
+            )
+            set_state(mode_key, "auto_pending", True)
+            st.rerun()
+        else:
+            st.warning(f"⏸ Paused after {pos}/{total} stocks (time budget reached). "
+                       "Click **Resume** above to continue, or turn on Auto-continue in the sidebar.")
     else:
         st.success(f"✅ Scan complete — {len(results)} match(es) out of {total} scanned.")
         set_state(mode_key, "checkpoint", None)
+        set_state(mode_key, "auto_pending", False)
+        if resume_placeholder is not None:
+            # The Resume button above was drawn at the START of this leg
+            # using the checkpoint as it stood THEN (e.g. "6/7"). The scan
+            # has since finished inside this very call, so that button is
+            # now stale and misleading -- erase it rather than leave a
+            # "Resume" button sitting next to a "Scan complete" message.
+            resume_placeholder.empty()
 
 
 # --------------------------------------------------------------------- #
@@ -422,7 +510,7 @@ def download_buttons(mode_key: str, df_all: pd.DataFrame, df_filtered: pd.DataFr
             file_name=f"{filename_prefix}_{datetime.now():%Y%m%d_%H%M%S}.csv",
             mime="text/csv",
             key=sskey(mode_key, "download_btn"),
-            use_container_width=True,
+            width="stretch",
         )
     except Exception as e:
         st.caption(f"(Download unavailable: {e})")

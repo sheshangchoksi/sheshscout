@@ -176,11 +176,11 @@ def render() -> None:
         analysis.update({"symbol": rec["symbol"], "name": rec["name"], "yf_symbol": rec["yf_symbol"], "exchange": rec["exchange"]})
         return "ok", analysis
 
-    do_scan, resume_scan, checkpoint, _sig = sc.render_scan_trigger(
+    do_scan, resume_scan, checkpoint, _sig, resume_ph = sc.render_scan_trigger(
         MODE_KEY, stocks_to_scan, f"🔍 SCAN {len(stocks_to_scan)} STOCKS FOR SHORT SETUPS")
 
     if do_scan or resume_scan:
-        sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint)
+        sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint, resume_ph)
 
     _render_results()
 
@@ -243,7 +243,7 @@ def _render_results() -> None:
         "Price (₹)": "₹{:.2f}", "Change %": "{:+.2f}%", "Volume Ratio": "{:.2f}x",
         "Dist from High (%)": "{:.2f}%", "5D Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
     })
-    st.dataframe(styled, use_container_width=True, height=400)
+    st.dataframe(styled, width="stretch", height=400)
 
     st.markdown("---")
     st.subheader("🔍 Detailed Stock Analysis")
@@ -284,13 +284,13 @@ def _render_results() -> None:
             fig1.add_hline(y=result["open"], line_dash="dash", line_color="gray", line_width=1, annotation_text="Open")
             fig1.update_layout(title=f"Price Chart ({chart_timeframe})", xaxis_title="Time", yaxis_title="Price (₹)",
                                 height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig1, use_container_width=True)
+            st.plotly_chart(fig1, width="stretch")
         with cc2:
             fig2 = go.Figure()
             fig2.add_trace(go.Bar(x=chart_data.index, y=chart_data["Volume"], name="Volume", marker_color="#17a2b8"))
             fig2.update_layout(title=f"Volume ({chart_timeframe})", xaxis_title="Time", yaxis_title="Volume",
                                 height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
         with cc3:
             closes = chart_data["Close"].values
             rsi_vals, rsi_idx = [], []
@@ -310,7 +310,7 @@ def _render_results() -> None:
                 fig3.add_hline(y=30, line_dash="dash", line_color="green", line_width=1)
             fig3.update_layout(title=f"RSI ({chart_timeframe})", xaxis_title="Time", yaxis_title="RSI",
                                 height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig3, use_container_width=True)
+            st.plotly_chart(fig3, width="stretch")
     else:
         st.warning(f"No chart data available for {result['symbol']}")
 
