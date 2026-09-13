@@ -137,6 +137,11 @@ def render() -> None:
                                       key=sskey(MODE_KEY, "min_volume"))
         min_conditions = st.slider("Min Conditions (out of 7)", 2, 7, 4, key=sskey(MODE_KEY, "min_conditions"))
         min_score = st.slider("Min Score (0-100)", 20, 90, 50, 5, key=sskey(MODE_KEY, "min_score"))
+        min_market_cap_cr = st.number_input(
+            "Min Market Cap (₹ Cr)", min_value=0, max_value=1000000, value=0, step=500,
+            key=sskey(MODE_KEY, "min_mcap"),
+            help="0 = no market-cap filter. Stocks whose market cap can't be determined are never filtered out.",
+        )
 
     with st.sidebar.expander("Advanced Thresholds"):
         price_change_threshold = st.slider("Price Change (%)", -5.0, 1.0, 0.0, 0.5, key=sskey(MODE_KEY, "price_chg_th"))
@@ -163,6 +168,7 @@ def render() -> None:
         "volume_ratio_threshold": volume_ratio_threshold, "rsi_threshold": rsi_threshold,
         "atr_threshold": atr_threshold, "rsi_period": rsi_period, "atr_period": atr_period,
         "momentum_window": momentum_window, "strong_score": strong_score,
+        "min_market_cap_cr": min_market_cap_cr,
     }
     set_state(MODE_KEY, "trading_settings", {"stop_loss_pct": stop_loss_pct, "target_pct": target_pct, "chart_height": chart_height})
 
@@ -173,6 +179,14 @@ def render() -> None:
         analysis = score_short(snap, params)
         if analysis is None:
             return "filtered", None
+
+        shares_out = intraday_data.fetch_shares_outstanding(rec["yf_symbol"])
+        market_cap_cr = (shares_out * analysis["price"] / 1e7) if shares_out else None
+        if params["min_market_cap_cr"] > 0 and market_cap_cr is not None and market_cap_cr < params["min_market_cap_cr"]:
+            return "filtered", None
+
+        analysis["market_cap_cr"] = market_cap_cr
+        analysis["market_cap_category"] = sc.market_cap_category(market_cap_cr)
         analysis.update({"symbol": rec["symbol"], "name": rec["name"], "yf_symbol": rec["yf_symbol"], "exchange": rec["exchange"]})
         return "ok", analysis
 
@@ -212,19 +226,43 @@ def _render_results() -> None:
         st.warning("⚠️ No stocks found matching criteria")
         return
 
-    results = sorted(results, key=lambda x: x["score"], reverse=True)
     st.markdown("---")
     st.success(f"✅ Found {len(results)} potential short-selling opportunities!")
+
+    st.markdown("#### Screener Results Summary")
+
+    cap_options = ["Large Cap", "Mid Cap", "Small Cap", "Unknown"]
+    f1, f2 = st.columns([1, 1])
+    with f1:
+        cap_filter = st.multiselect("Market Cap", cap_options, default=cap_options, key=sskey(MODE_KEY, "cap_filter"))
+    with f2:
+        sort_by = st.selectbox(
+            "Sort by", ["Score", "Market Cap", "Change %", "Volume Ratio", "5D Trend"],
+            key=sskey(MODE_KEY, "sort_by"),
+        )
+
+    results = [r for r in results if r.get("market_cap_category", "Unknown") in cap_filter]
+    if not results:
+        st.warning("⚠️ No results match the current Market Cap filter.")
+        return
+
+    _sort_key = {
+        "Score": lambda x: x["score"],
+        "Market Cap": lambda x: x.get("market_cap_cr") if x.get("market_cap_cr") is not None else -1,
+        "Change %": lambda x: x["change_pct"],
+        "Volume Ratio": lambda x: x["volume_ratio"],
+        "5D Trend": lambda x: x["recent_trend"],
+    }[sort_by]
+    results = sorted(results, key=_sort_key, reverse=True)
 
     df = pd.DataFrame([{
         "Symbol": r["symbol"], "Name": r.get("name", ""), "Exchange": r.get("exchange", ""),
         "Price (₹)": r["price"], "Change %": r["change_pct"], "Score": r["score"],
-        "Signal": r["signal_strength"], "Volume Ratio": r["volume_ratio"],
+        "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
+        "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
         "Dist from High (%)": r["dist_from_high"], "5D Trend (%)": r["recent_trend"],
         "RSI": r["rsi"], "ATR %": r["atr_pct"], "Conditions": r["conditions"],
     } for r in results])
-
-    st.markdown("#### Screener Results Summary")
 
     def color_signal(val):
         if val == "STRONG":
@@ -241,8 +279,9 @@ def _render_results() -> None:
 
     styled = df.style.map(color_signal, subset=["Signal"]).map(color_change, subset=["Change %", "5D Trend (%)"]).format({
         "Price (₹)": "₹{:.2f}", "Change %": "{:+.2f}%", "Volume Ratio": "{:.2f}x",
-        "Dist from High (%)": "{:.2f}%", "5D Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
-    })
+        "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from High (%)": "{:.2f}%", "5D Trend (%)": "{:+.2f}%",
+        "RSI": "{:.1f}", "ATR %": "{:.2f}%",
+    }, na_rep="—")
     st.dataframe(styled, width="stretch", height=400)
 
     st.markdown("---")

@@ -49,6 +49,21 @@ else:
 MODE_LONG = "long"
 MODE_SHORT = "short"
 
+# Rough, rule-of-thumb Indian market-cap bands (₹ Cr) shared by both modes
+# so "Large/Mid/Small Cap" means the same thing regardless of screener.
+_LARGE_CAP_CR = 20000
+_MID_CAP_CR = 5000
+
+
+def market_cap_category(market_cap_cr: Optional[float]) -> str:
+    if market_cap_cr is None:
+        return "Unknown"
+    if market_cap_cr >= _LARGE_CAP_CR:
+        return "Large Cap"
+    if market_cap_cr >= _MID_CAP_CR:
+        return "Mid Cap"
+    return "Small Cap"
+
 _HERE = Path(__file__).parent
 _NSE_CSV = _HERE / "nse_tickers.csv"
 _BSE_CSV = _HERE / "bse_codes.csv"

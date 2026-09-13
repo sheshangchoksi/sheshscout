@@ -87,6 +87,41 @@ def fetch_intraday_snapshot(yf_symbol: str):
         return None
 
 
+# Shares outstanding barely moves day to day, so it gets its own much
+# longer-lived cache entry, separate from the 45s intraday snapshot cache.
+_SHARES_CACHE_TTL_S = 24 * 3600
+
+
+def fetch_shares_outstanding(yf_symbol: str):
+    """Shares outstanding for `yf_symbol`, or None if unavailable.
+
+    Deliberately NOT using yfinance's own fast_info["market_cap"] /
+    fast_info["last_price"] here -- those pull a full 1y price history per
+    symbol just to derive a last price we already have from the intraday
+    snapshot. Fetching only shares (a lighter, dedicated endpoint) and
+    multiplying by the price we already fetched gets the same number for
+    a fraction of the Yahoo load, and the 24h cache means a symbol scanned
+    repeatedly through the day only pays for this once.
+    """
+    if sc.is_known_dead(yf_symbol):
+        return None
+
+    cache_key = f"shares_out:{yf_symbol}"
+    cached = sc.cache_get(cache_key, _SHARES_CACHE_TTL_S)
+    if cached is not None:
+        return cached
+
+    try:
+        shares = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).fast_info.get("shares"))
+        if not shares:
+            return None
+        shares = float(shares)
+        sc.cache_set(cache_key, shares)
+        return shares
+    except Exception:
+        return None
+
+
 def fetch_chart_history(yf_symbol: str, period: str, interval: str):
     """For the detail-view chart's user-selected timeframe. Cached briefly
     to survive re-renders (filter tweaks, etc.) without a fresh Yahoo hit."""
