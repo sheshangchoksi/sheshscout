@@ -568,13 +568,23 @@ def _render_results() -> None:
     u1, u2, u3, u4 = st.columns(4)
     u1.metric("Risk / share", f"₹{lv['risk']:.2f}", f"{lv['risk_pct']:.2f}% of entry", delta_color="off")
     u2.metric("Reward / share", f"₹{lv['reward']:.2f}", f"{lv['reward_pct']:.2f}% of entry", delta_color="off")
-    if result["atr"] > 0 and lv["risk"] < result["atr"] * 0.5:
+    if result["atr"] <= 0:
+        u3.metric("ATR", "—", "not enough intraday data yet", delta_color="off")
+    elif lv["risk"] < result["atr"] * 0.5:
         u3.metric("ATR", f"₹{result['atr']:.2f}", "stop tighter than typical noise ⚠️", delta_color="off")
-    elif result["atr"] > 0 and lv["risk"] > result["atr"] * 3:
+    elif lv["risk"] > result["atr"] * 3:
         u3.metric("ATR", f"₹{result['atr']:.2f}", "stop much wider than ATR", delta_color="off")
     else:
         u3.metric("ATR", f"₹{result['atr']:.2f}", "stop is a reasonable multiple of ATR", delta_color="off")
     u4.metric(f"Qty for ₹{risk_per_trade:,.0f} risk", f"{suggested_qty:,} sh", f"≈ ₹{position_value:,.0f} position", delta_color="off")
+
+    # See mode_intraday_long's identical comment: a real support level can
+    # sit far below entry (an old swing low), which is technically real but
+    # not a realistic same-session target for an intraday screener.
+    if lv["used_real_target"] and lv["reward_pct"] > 3:
+        st.caption(f"🕒 Target is {lv['reward_pct']:.1f}% away — that's a large move for a single session; "
+                   f"the R:R above assumes it gets hit today, which may not happen. Consider a nearer "
+                   f"partial target or trailing the stop instead of holding for the full move.")
 
     st.markdown("**✅ Conditions met**")
     st.markdown("\n".join(f"- {c}" for c in result.get("conditions_list", [])) or "_none_")
