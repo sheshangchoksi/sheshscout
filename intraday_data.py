@@ -26,7 +26,7 @@ from scanner_common import yf
 _CACHE_TTL_S = 45
 
 
-def fetch_intraday_snapshot(yf_symbol: str):
+def fetch_intraday_snapshot(yf_symbol: str, retries: int = 3):
     """Returns a dict of numpy arrays / floats, or None if the symbol has no
     tradable data right now (pre-market, delisted, holiday, etc.)."""
     if sc.is_known_dead(yf_symbol):
@@ -41,8 +41,16 @@ def fetch_intraday_snapshot(yf_symbol: str):
         ticker = yf.Ticker(yf_symbol)
         # 1-minute intraday bars have no free public source for NSE/BSE, so
         # this one call stays on yfinance no matter what — see bhavcopy.py's
-        # module docstring for why.
-        intraday = ticker.history(period="1d", interval="1m")
+        # module docstring for why. Routed through bulletproof_fetch (not
+        # called directly) so a transient network blip actually gets
+        # retried `retries` times before giving up -- calling it bare here
+        # and relying on an *outer* bulletproof_fetch wrapper around this
+        # whole function doesn't work, since this function's own try/except
+        # below always catches the exception first and returns None, so an
+        # outer retry wrapper would never see a failure to retry.
+        intraday = sc.bulletproof_fetch(lambda: ticker.history(period="1d", interval="1m"), retries=retries)
+        if intraday is None:
+            return None
 
         # The plain 5-day *daily* reference bars ARE ordinary EOD data, so
         # try NSE/BSE's own bhavcopy first — zero Yahoo calls when it has
@@ -53,7 +61,9 @@ def fetch_intraday_snapshot(yf_symbol: str):
             daily_volume = bhav["volume"].values.astype(float)
             daily_is_empty = False
         else:
-            daily = ticker.history(period="5d", interval="1d")
+            daily = sc.bulletproof_fetch(lambda: ticker.history(period="5d", interval="1d"), retries=retries)
+            if daily is None:
+                return None
             daily_close = daily["Close"].values.astype(float)
             daily_volume = daily["Volume"].values.astype(float)
             daily_is_empty = daily.empty
@@ -69,6 +79,12 @@ def fetch_intraday_snapshot(yf_symbol: str):
         snapshot = {
             "yf_symbol": yf_symbol,
             "intraday_open": float(intraday["Open"].iloc[0]),
+            # Per-bar opens (NOT the same as "intraday_open" above, which is
+            # the single session-opening price both mode files already rely
+            # on for gap/price-change math) -- kept separate so candlestick
+            # shape detection has a real open for each 1-min bar without
+            # disturbing the existing key.
+            "intraday_open_bars": intraday["Open"].values.astype(float),
             "intraday_close": intraday["Close"].values.astype(float),
             "intraday_high": intraday["High"].values.astype(float),
             "intraday_low": intraday["Low"].values.astype(float),
@@ -92,7 +108,7 @@ def fetch_intraday_snapshot(yf_symbol: str):
 _SHARES_CACHE_TTL_S = 24 * 3600
 
 
-def fetch_shares_outstanding(yf_symbol: str):
+def fetch_shares_outstanding(yf_symbol: str, retries: int = 3):
     """Shares outstanding for `yf_symbol`, or None if unavailable.
 
     Deliberately NOT using yfinance's own fast_info["market_cap"] /
@@ -112,7 +128,7 @@ def fetch_shares_outstanding(yf_symbol: str):
         return cached
 
     try:
-        shares = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).fast_info.get("shares"))
+        shares = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).fast_info.get("shares"), retries=retries)
         if not shares:
             return None
         shares = float(shares)
@@ -129,7 +145,7 @@ def fetch_shares_outstanding(yf_symbol: str):
 _HOURLY_CACHE_TTL_S = 20 * 60
 
 
-def fetch_hourly_context(yf_symbol: str):
+def fetch_hourly_context(yf_symbol: str, retries: int = 3):
     """Real support/resistance levels and the hourly trend direction, built
     from 5 days of hourly bars -- the higher-timeframe context an intraday
     signal needs to mean anything (a stock "near day low" tells you nothing
@@ -149,7 +165,7 @@ def fetch_hourly_context(yf_symbol: str):
         return cached
 
     try:
-        hourly = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period="5d", interval="1h"))
+        hourly = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period="5d", interval="1h"), retries=retries)
         if hourly is None or hourly.empty or len(hourly) < 6:
             return None
 
@@ -180,7 +196,7 @@ def fetch_hourly_context(yf_symbol: str):
         return None
 
 
-def fetch_chart_history(yf_symbol: str, period: str, interval: str):
+def fetch_chart_history(yf_symbol: str, period: str, interval: str, retries: int = 3):
     """For the detail-view chart's user-selected timeframe. Cached briefly
     to survive re-renders (filter tweaks, etc.) without a fresh Yahoo hit."""
     cache_key = f"chart_hist:{yf_symbol}:{period}:{interval}"
@@ -188,7 +204,7 @@ def fetch_chart_history(yf_symbol: str, period: str, interval: str):
     if cached is not None:
         return cached
     try:
-        data = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period=period, interval=interval))
+        data = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period=period, interval=interval), retries=retries)
         if data is not None:
             sc.cache_set(cache_key, data)
         return data

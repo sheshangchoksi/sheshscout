@@ -4,7 +4,7 @@ mode_intraday_long.py — Intraday long/buy screener.
 CORE LOGIC that makes this mode distinct: score_long() below — the mirror
 image of the short screener's conditions (up from open, near day low as a
 bounce/breakout zone, uptrend, positive momentum, RSI oversold, etc).
-Everything else is shared with the other 2 modes via scanner_common /
+Everything else is shared with the other mode via scanner_common /
 intraday_data.
 """
 
@@ -14,6 +14,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import candlesticks
 import indicators
 import intraday_data
 import scanner_common as sc
@@ -92,6 +93,24 @@ def score_long(snap, params, hourly_ctx=None, index_change_pct=None):
             dist_from_support = ((current_price - hourly_ctx["support"]) / hourly_ctx["support"]) * 100
             hourly_trend_pct = hourly_ctx.get("hourly_trend_pct")
 
+        # Candlestick confirmation: per the reference strategy material, a
+        # move near support is only a valid long entry once a reversal/
+        # indecision candle actually shows up there -- a hammer in the
+        # middle of nowhere isn't a signal, so this is only checked (and
+        # only ever adds a bonus, never gates) when price is ALSO near the
+        # real support level below.
+        near_support = dist_from_support is not None and dist_from_support < params["dist_from_support_threshold"]
+        candle = {"pattern": None, "bullish": False, "bearish": False}
+        if near_support:
+            candle = candlesticks.detect_pattern(
+                snap.get("intraday_open_bars"), snap["intraday_high"], snap["intraday_low"], closes,
+                lookback=params["candle_lookback"],
+            )
+        # Bullish shapes are a straightforward confirmation; doji is
+        # direction-agnostic on its own but still counts as a reversal
+        # candidate at support per the source material.
+        candle_confirmed = near_support and (candle["bullish"] or candle["pattern"] == "doji")
+
         conditions_met = []
         warnings = []
 
@@ -112,8 +131,10 @@ def score_long(snap, params, hourly_ctx=None, index_change_pct=None):
         if atr_pct > params["atr_threshold"]:
             conditions_met.append("Good volatility")
 
-        if dist_from_support is not None and dist_from_support < params["dist_from_support_threshold"]:
+        if near_support:
             conditions_met.append("Near real support (hourly)")
+        if candle_confirmed:
+            conditions_met.append(f"{candlesticks.PATTERN_LABELS.get(candle['pattern'], candle['pattern'])} at support confirmed")
         if hourly_trend_pct is not None:
             if hourly_trend_pct > params["hourly_trend_threshold"]:
                 conditions_met.append("Hourly uptrend confirmed")
@@ -155,6 +176,8 @@ def score_long(snap, params, hourly_ctx=None, index_change_pct=None):
         if dist_from_support is not None:
             if dist_from_support < 1: score += 15
             elif dist_from_support < 2: score += 8
+        if candle_confirmed:
+            score += 12
         if hourly_trend_pct is not None and hourly_trend_pct > params["hourly_trend_threshold"]:
             score += 10
         if index_change_pct is not None and index_change_pct > -0.1:
@@ -179,15 +202,54 @@ def score_long(snap, params, hourly_ctx=None, index_change_pct=None):
         return {
             "price": current_price, "open": open_price, "high": high_price, "low": low_price,
             "change_pct": price_change_pct, "volume": volume, "volume_ratio": volume_ratio,
+            "avg_volume_5d": avg_volume_5d,
             "dist_from_low": dist_from_low, "recent_trend": recent_change, "momentum": momentum_change,
-            "rsi": rsi if rsi else 0, "atr_pct": atr_pct, "score": score,
+            "rsi": rsi if rsi else 0, "atr": atr, "atr_pct": atr_pct, "score": score,
             "dist_from_support": dist_from_support, "hourly_trend_pct": hourly_trend_pct,
             "index_change_pct": index_change_pct,
+            # Raw S/R levels (not just the % distance already stored above) --
+            # kept so the trade-levels panel can set a stop/target off the
+            # actual hourly support/resistance instead of an arbitrary fixed
+            # %, which is what was making the R:R ratio identical for every
+            # single result regardless of price or level.
+            "support_level": hourly_ctx.get("support") if hourly_ctx else None,
+            "resistance_level": hourly_ctx.get("resistance") if hourly_ctx else None,
+            "candle_pattern": candlesticks.PATTERN_LABELS.get(candle["pattern"]) if candle_confirmed else None,
             "conditions": conditions_text,
+            # Structured versions of the same info in "conditions_text" above
+            # -- kept alongside it (rather than replacing it) so the detail
+            # view can render a real checklist / a distinct warnings box
+            # instead of parsing them back out of one comma-joined string.
+            "conditions_list": conditions_met, "warnings_list": warnings,
             "signal_strength": "STRONG" if score >= params["strong_score"] else "MODERATE" if score >= 50 else "WEAK",
         }
     except Exception:
         return None
+
+
+def _trade_levels(result: dict, trading: dict) -> dict:
+    """Stop/target/risk/reward for one result, shared by the summary table's
+    R:R column and the detail view's trade card so the two can never drift
+    apart (they're computed once, here, instead of twice). BUY: stop is
+    BELOW entry (real support when it's actually below entry, else the
+    fixed-% fallback), target is ABOVE entry (real resistance, same rule)."""
+    price = result["price"]
+    support_level = result.get("support_level")
+    resistance_level = result.get("resistance_level")
+    used_real_stop = support_level is not None and support_level < price
+    used_real_target = resistance_level is not None and resistance_level > price
+    stop_loss = support_level if used_real_stop else price * (1 - trading["stop_loss_pct"] / 100)
+    target = resistance_level if used_real_target else price * (1 + trading["target_pct"] / 100)
+    risk = abs(price - stop_loss)
+    reward = abs(target - price)
+    return {
+        "stop_loss": stop_loss, "target": target,
+        "used_real_stop": used_real_stop, "used_real_target": used_real_target,
+        "risk": risk, "reward": reward,
+        "risk_pct": (risk / price) * 100 if price else 0,
+        "reward_pct": (reward / price) * 100 if price else 0,
+        "risk_reward": reward / risk if risk > 0 else 0,
+    }
 
 
 # ── UI ───────────────────────────────────────────────────────────────────
@@ -206,7 +268,12 @@ def render() -> None:
                                      key=sskey(MODE_KEY, "min_price"))
         min_volume = st.number_input("Min Volume", min_value=10000, max_value=10000000, value=100000, step=10000,
                                       key=sskey(MODE_KEY, "min_volume"))
-        min_conditions = st.slider("Min Conditions (out of 10)", 2, 10, 4, key=sskey(MODE_KEY, "min_conditions"))
+        min_conditions = st.slider(
+            "Min Conditions (out of 12)", 2, 12, 4, key=sskey(MODE_KEY, "min_conditions"),
+            help="12 possible: price/momentum/volume/RSI/ATR/trend basics, real S/R proximity, "
+                 "candle confirmation, hourly-trend agreement, index agreement, and gap-pullback / "
+                 "gap-bounce confirmation.",
+        )
         min_score = st.slider("Min Score (0-100)", 20, 90, 50, 5, key=sskey(MODE_KEY, "min_score"))
         min_market_cap_cr = st.number_input(
             "Min Market Cap (₹ Cr)", min_value=0, max_value=1000000, value=0, step=500,
@@ -234,6 +301,12 @@ def render() -> None:
             "Gap Threshold (%)", 0.5, 5.0, 1.0, 0.5, key=sskey(MODE_KEY, "gap_th"),
             help="Gap-up opens beyond this, with no pullback anywhere in the session, get penalized as chase risk.",
         )
+        candle_lookback = st.slider(
+            "Candle Lookback (bars)", 1, 10, 5, 1, key=sskey(MODE_KEY, "candle_lookback"),
+            help="How many recent 1-min bars to scan for a hammer/doji/marubozu/engulfing "
+                 "confirmation near support -- only checked when price is already near real "
+                 "support, and only ever a score bonus, never a filter.",
+        )
 
     with st.sidebar.expander("Technical Indicators & Trading Settings"):
         rsi_period = st.number_input("RSI Period", 5, 50, 14, 1, key=sskey(MODE_KEY, "rsi_period"))
@@ -241,6 +314,11 @@ def render() -> None:
         momentum_window = st.number_input("Momentum Window (min)", 10, 120, 30, 5, key=sskey(MODE_KEY, "mom_window"))
         stop_loss_pct = st.number_input("Stop Loss % below Entry Price", 0.1, 5.0, 0.5, 0.1, key=sskey(MODE_KEY, "sl_pct"))
         target_pct = st.number_input("Target % above Entry Price", 0.5, 20.0, 2.0, 0.5, key=sskey(MODE_KEY, "tgt_pct"))
+        risk_per_trade = st.number_input(
+            "Risk per Trade (₹)", 100, 1000000, 1000, 100, key=sskey(MODE_KEY, "risk_per_trade"),
+            help="Max ₹ you're willing to lose if the stop is hit -- used only to suggest a position "
+                 "size in the trade card below, never affects scoring.",
+        )
         strong_score = st.number_input("Strong Signal Score", 60, 90, 70, 5, key=sskey(MODE_KEY, "strong_score"))
         chart_height = st.number_input("Chart Height (px)", 200, 500, 250, 50, key=sskey(MODE_KEY, "chart_height"))
 
@@ -254,11 +332,23 @@ def render() -> None:
         "min_market_cap_cr": min_market_cap_cr,
         "dist_from_support_threshold": dist_from_support_threshold,
         "hourly_trend_threshold": hourly_trend_threshold, "gap_threshold": gap_threshold,
+        "candle_lookback": candle_lookback,
     }
-    set_state(MODE_KEY, "trading_settings", {"stop_loss_pct": stop_loss_pct, "target_pct": target_pct, "chart_height": chart_height})
+    set_state(MODE_KEY, "trading_settings", {
+        "stop_loss_pct": stop_loss_pct, "target_pct": target_pct,
+        "risk_per_trade": risk_per_trade, "chart_height": chart_height,
+    })
 
     def fetch_and_analyze(rec):
-        snap = sc.bulletproof_fetch(intraday_data.fetch_intraday_snapshot, rec["yf_symbol"])
+        # fetch_intraday_snapshot now does its own bulletproof_fetch
+        # internally on the actual Yahoo calls (see its docstring for why
+        # wrapping the whole function in another bulletproof_fetch here was
+        # a no-op: it always caught its own exceptions and returned None
+        # before an outer retry wrapper ever saw a failure to retry). Pass
+        # the user's "Retries per symbol" setting straight through instead
+        # of the hard-coded default -- that sidebar control did nothing at
+        # all before this.
+        snap = intraday_data.fetch_intraday_snapshot(rec["yf_symbol"], retries=rate_cfg["retries"])
         if snap is None:
             return "failed", None
 
@@ -266,11 +356,11 @@ def render() -> None:
         # index's move (per-exchange, cached 45s and shared across the
         # whole batch) -- both cheap in practice since they're fetched far
         # less often than the 45s intraday snapshot itself.
-        hourly_ctx = intraday_data.fetch_hourly_context(rec["yf_symbol"])
+        hourly_ctx = intraday_data.fetch_hourly_context(rec["yf_symbol"], retries=rate_cfg["retries"])
         index_change_pct = None
         index_symbol = sc.INDEX_FOR_EXCHANGE.get(rec["exchange"])
         if index_symbol:
-            index_snap = sc.bulletproof_fetch(intraday_data.fetch_intraday_snapshot, index_symbol)
+            index_snap = intraday_data.fetch_intraday_snapshot(index_symbol, retries=rate_cfg["retries"])
             if index_snap is not None and index_snap.get("intraday_open"):
                 index_change_pct = ((index_snap["intraday_close"][-1] - index_snap["intraday_open"])
                                      / index_snap["intraday_open"]) * 100
@@ -279,7 +369,7 @@ def render() -> None:
         if analysis is None:
             return "filtered", None
 
-        shares_out = intraday_data.fetch_shares_outstanding(rec["yf_symbol"])
+        shares_out = intraday_data.fetch_shares_outstanding(rec["yf_symbol"], retries=rate_cfg["retries"])
         market_cap_cr = (shares_out * analysis["price"] / 1e7) if shares_out else None
         if params["min_market_cap_cr"] > 0 and market_cap_cr is not None and market_cap_cr < params["min_market_cap_cr"]:
             return "filtered", None
@@ -327,6 +417,13 @@ def _render_results() -> None:
     st.markdown("---")
     st.success(f"✅ Found {len(results)} potential buy opportunities!")
 
+    # Fetched once up front: the table's R:R column and the sort option both
+    # need it, and it's what the detail view's trade card uses too via the
+    # shared _trade_levels() helper -- one source of truth for "what's the
+    # stop/target" instead of two implementations that could drift apart.
+    trading_defaults = get_state(MODE_KEY, "trading_settings",
+                                  {"stop_loss_pct": 0.5, "target_pct": 2.0, "risk_per_trade": 1000, "chart_height": 250})
+
     st.markdown("#### Screener Results Summary")
 
     cap_options = ["Large Cap", "Mid Cap", "Small Cap", "Unknown"]
@@ -335,7 +432,7 @@ def _render_results() -> None:
         cap_filter = st.multiselect("Market Cap", cap_options, default=cap_options, key=sskey(MODE_KEY, "cap_filter"))
     with f2:
         sort_by = st.selectbox(
-            "Sort by", ["Score", "Market Cap", "Change %", "Volume Ratio", "5D Trend"],
+            "Sort by", ["Score", "Market Cap", "Change %", "Volume Ratio", "5D Trend", "R:R Ratio"],
             key=sskey(MODE_KEY, "sort_by"),
         )
 
@@ -350,6 +447,7 @@ def _render_results() -> None:
         "Change %": lambda x: x["change_pct"],
         "Volume Ratio": lambda x: x["volume_ratio"],
         "5D Trend": lambda x: x["recent_trend"],
+        "R:R Ratio": lambda x: _trade_levels(x, trading_defaults)["risk_reward"],
     }[sort_by]
     results = sorted(results, key=_sort_key, reverse=True)
 
@@ -359,8 +457,11 @@ def _render_results() -> None:
         "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
         "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
         "Dist from Low (%)": r["dist_from_low"], "Dist from Support (%)": r.get("dist_from_support"),
+        "Support (₹)": r.get("support_level"), "Resistance (₹)": r.get("resistance_level"),
+        "R:R": _trade_levels(r, trading_defaults)["risk_reward"] or None,
         "5D Trend (%)": r["recent_trend"], "Hourly Trend (%)": r.get("hourly_trend_pct"),
-        "RSI": r["rsi"], "ATR %": r["atr_pct"], "Conditions": r["conditions"],
+        "RSI": r["rsi"], "ATR %": r["atr_pct"], "Candle Pattern": r.get("candle_pattern"),
+        "Conditions": r["conditions"],
     } for r in results])
 
     def color_signal(val):
@@ -379,6 +480,7 @@ def _render_results() -> None:
     styled = df.style.map(color_signal, subset=["Signal"]).map(color_change, subset=["Change %", "5D Trend (%)"]).format({
         "Price (₹)": "₹{:.2f}", "Change %": "{:+.2f}%", "Volume Ratio": "{:.2f}x",
         "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from Low (%)": "{:.2f}%", "Dist from Support (%)": "{:.2f}%",
+        "Support (₹)": "₹{:.2f}", "Resistance (₹)": "₹{:.2f}", "R:R": "1:{:.2f}",
         "5D Trend (%)": "{:+.2f}%", "Hourly Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
     }, na_rep="—")
     st.dataframe(styled, width="stretch", height=400)
@@ -399,13 +501,16 @@ def _render_results() -> None:
     result = results[idx_by_option[selected_option]]
 
     st.markdown(f"##### {result['symbol']} — {result['signal_strength']} (Score: {result['score']})")
-    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("Price", f"₹{result['price']:.2f}", f"{result['change_pct']:.2f}%")
-    m2.metric("Low", f"₹{result['low']:.2f}")
-    m3.metric("Dist from Low", f"{result['dist_from_low']:.2f}%")
+    m2.metric("Day Range", f"₹{result['low']:.2f} – ₹{result['high']:.2f}")
+    m3.metric("Volume", f"{result['volume']:,.0f}", f"vs 5D avg {result.get('avg_volume_5d', 0):,.0f}", delta_color="off")
     m4.metric("Vol Ratio", f"{result['volume_ratio']:.2f}x")
+    m5, m6, m7, m8 = st.columns(4)
     m5.metric("RSI", f"{result['rsi']:.1f}")
-    m6.metric("5D Trend", f"{result['recent_trend']:.2f}%")
+    m6.metric("ATR", f"₹{result['atr']:.2f}", f"{result['atr_pct']:.2f}% of price", delta_color="off")
+    m7.metric("5D Trend", f"{result['recent_trend']:.2f}%")
+    m8.metric("Hourly Trend", f"{result['hourly_trend_pct']:.2f}%" if result.get("hourly_trend_pct") is not None else "—")
 
     period, interval = _TIMEFRAME_MAP[chart_timeframe]
     chart_data = intraday_data.fetch_chart_history(result["yf_symbol"], period, interval)
@@ -436,8 +541,24 @@ def _render_results() -> None:
                     diffs = window[1:] - window[:-1]
                     gains = diffs[diffs > 0].sum() / len(window)
                     losses = -diffs[diffs < 0].sum() / len(window)
-                    rs = gains / losses if losses else 0
-                    rsi_vals.append(100 - (100 / (1 + rs)) if rs > 0 else 50)
+                    # rs=0 legitimately means "no losses in the window" only
+                    # when there WERE gains (-> RSI should read 100, maximal
+                    # overbought); it's a different, opposite case when there
+                    # were also no gains (flat window -> RSI 50). The old
+                    # "rs>0 else 50" check conflated both under "no losses"
+                    # AND "no gains" into the same rs=0 value, so a strongly
+                    # up-trending window (all gains, zero losses) was
+                    # misreported as neutral RSI 50 instead of 100 -- and
+                    # symmetrically, an all-losses window read 50 instead of 0.
+                    if losses == 0 and gains == 0:
+                        rsi_val = 50.0
+                    elif losses == 0:
+                        rsi_val = 100.0
+                    elif gains == 0:
+                        rsi_val = 0.0
+                    else:
+                        rsi_val = 100 - (100 / (1 + gains / losses))
+                    rsi_vals.append(rsi_val)
                     rsi_idx.append(chart_data.index[j])
             fig3 = go.Figure()
             if rsi_vals:
@@ -450,17 +571,40 @@ def _render_results() -> None:
     else:
         st.warning(f"No chart data available for {result['symbol']}")
 
-    # BUY: stop loss is BELOW entry, target is ABOVE entry
-    stop_loss = result["price"] * (1 - trading["stop_loss_pct"] / 100)
-    target = result["price"] * (1 + trading["target_pct"] / 100)
+    # BUY: stop loss is BELOW entry, target is ABOVE entry. Levels come from
+    # the shared _trade_levels() helper (real support/resistance when on the
+    # correct side of entry, else the fixed-% fallback) -- see that
+    # function's docstring for why using a fixed % for both used to make
+    # every result's R:R ratio identical.
+    lv = _trade_levels(result, trading)
+    stop_loss, target = lv["stop_loss"], lv["target"]
     t1, t2, t3, t4 = st.columns(4)
     t1.info(f"💡 Entry: ₹{result['price']:.2f}")
-    t2.error(f"🛑 Stop: ₹{stop_loss:.2f}")
-    t3.success(f"🎯 Target: ₹{target:.2f}")
-    risk = abs(result["price"] - stop_loss)
-    reward = abs(target - result["price"])
-    risk_reward = reward / risk if risk > 0 else 0
-    t4.metric("R:R Ratio", f"1:{risk_reward:.2f}")
-    st.caption(f"**Conditions:** {result['conditions']}")
+    t2.error(f"🛑 Stop: ₹{stop_loss:.2f}" + (" (real support)" if lv["used_real_stop"] else ""))
+    t3.success(f"🎯 Target: ₹{target:.2f}" + (" (real resistance)" if lv["used_real_target"] else ""))
+    t4.metric("R:R Ratio", f"1:{lv['risk_reward']:.2f}")
+
+    # Risk/reward in ₹ and %, an ATR sanity check on the stop, and a
+    # position-size suggestion for the risk budget set in the sidebar --
+    # the numbers an intraday trader actually needs to size and place the
+    # trade, not just look at it.
+    risk_per_trade = trading.get("risk_per_trade", 1000)
+    suggested_qty = int(risk_per_trade // lv["risk"]) if lv["risk"] > 0 else 0
+    position_value = suggested_qty * result["price"]
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric("Risk / share", f"₹{lv['risk']:.2f}", f"{lv['risk_pct']:.2f}% of entry", delta_color="off")
+    u2.metric("Reward / share", f"₹{lv['reward']:.2f}", f"{lv['reward_pct']:.2f}% of entry", delta_color="off")
+    if result["atr"] > 0 and lv["risk"] < result["atr"] * 0.5:
+        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop tighter than typical noise ⚠️", delta_color="off")
+    elif result["atr"] > 0 and lv["risk"] > result["atr"] * 3:
+        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop much wider than ATR", delta_color="off")
+    else:
+        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop is a reasonable multiple of ATR", delta_color="off")
+    u4.metric(f"Qty for ₹{risk_per_trade:,.0f} risk", f"{suggested_qty:,} sh", f"≈ ₹{position_value:,.0f} position", delta_color="off")
+
+    st.markdown("**✅ Conditions met**")
+    st.markdown("\n".join(f"- {c}" for c in result.get("conditions_list", [])) or "_none_")
+    if result.get("warnings_list"):
+        st.warning("⚠️ " + "; ".join(result["warnings_list"]))
 
     sc.download_buttons(MODE_KEY, df, df, "intraday_long_scan")
