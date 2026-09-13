@@ -18,6 +18,7 @@ import candlesticks
 import indicators
 import intraday_data
 import scanner_common as sc
+import streak_analysis
 from scanner_common import sskey, get_state, set_state
 
 MODE_KEY = sc.MODE_LONG
@@ -511,6 +512,8 @@ def _render_results() -> None:
     m6.metric("ATR", f"₹{result['atr']:.2f}", f"{result['atr_pct']:.2f}% of price", delta_color="off")
     m7.metric("5D Trend", f"{result['recent_trend']:.2f}%")
     m8.metric("Hourly Trend", f"{result['hourly_trend_pct']:.2f}%" if result.get("hourly_trend_pct") is not None else "—")
+
+    streak_analysis.render_streak_highlight(result, MODE_KEY)
 
     period, interval = _TIMEFRAME_MAP[chart_timeframe]
     chart_data = intraday_data.fetch_chart_history(result["yf_symbol"], period, interval)
