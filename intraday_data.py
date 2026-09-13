@@ -122,6 +122,64 @@ def fetch_shares_outstanding(yf_symbol: str):
         return None
 
 
+# Hourly bars only add a new bar once an hour, so this cache lives much
+# longer than the 45s intraday snapshot but far shorter than shares
+# outstanding (support/resistance and the hourly trend DO move, just not
+# minute to minute).
+_HOURLY_CACHE_TTL_S = 20 * 60
+
+
+def fetch_hourly_context(yf_symbol: str):
+    """Real support/resistance levels and the hourly trend direction, built
+    from 5 days of hourly bars -- the higher-timeframe context an intraday
+    signal needs to mean anything (a stock "near day low" tells you nothing
+    if today's low isn't near any level anyone else is watching; a 5-min
+    move that fights the hourly trend is a classic reversal setup, not a
+    confirmed one).
+
+    Returns {"resistance": float, "support": float, "hourly_trend_pct": float}
+    or None if hourly history isn't available/long enough to be meaningful.
+    """
+    if sc.is_known_dead(yf_symbol):
+        return None
+
+    cache_key = f"hourly_ctx:{yf_symbol}"
+    cached = sc.cache_get(cache_key, _HOURLY_CACHE_TTL_S)
+    if cached is not None:
+        return cached
+
+    try:
+        hourly = sc.bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period="5d", interval="1h"))
+        if hourly is None or hourly.empty or len(hourly) < 6:
+            return None
+
+        highs = hourly["High"].values.astype(float)
+        lows = hourly["Low"].values.astype(float)
+        closes = hourly["Close"].values.astype(float)
+
+        # Drop the most recent (still-forming) bar from the S/R lookback --
+        # otherwise "resistance" or "support" is trivially wherever price
+        # happens to be trading right now, not a level anyone actually
+        # traded around.
+        lookback_highs = highs[:-1] if len(highs) > 1 else highs
+        lookback_lows = lows[:-1] if len(lows) > 1 else lows
+        resistance = float(np.max(lookback_highs))
+        support = float(np.min(lookback_lows))
+
+        # Hourly trend: last 3 hourly closes vs the 3 before that -- same
+        # "recent window vs prior window" shape as the intraday momentum
+        # check in the scoring functions, just on the hourly frame.
+        recent = closes[-3:].mean()
+        prior = closes[-6:-3].mean()
+        hourly_trend_pct = ((recent - prior) / prior) * 100 if prior else 0.0
+
+        context = {"resistance": resistance, "support": support, "hourly_trend_pct": float(hourly_trend_pct)}
+        sc.cache_set(cache_key, context)
+        return context
+    except Exception:
+        return None
+
+
 def fetch_chart_history(yf_symbol: str, period: str, interval: str):
     """For the detail-view chart's user-selected timeframe. Cached briefly
     to survive re-renders (filter tweaks, etc.) without a fresh Yahoo hit."""

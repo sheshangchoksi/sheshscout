@@ -31,11 +31,12 @@ _TIMEFRAME_MAP = {
 
 
 # ── CORE LOGIC: short-setup scoring ─────────────────────────────────────
-def score_short(snap, params):
+def score_short(snap, params, hourly_ctx=None, index_change_pct=None):
     try:
         current_price = snap["intraday_close"][-1]
         open_price = snap["intraday_open"]
         high_price = snap["day_high"]
+        low_price = snap["day_low"]
         volume = float(snap["intraday_volume"].sum())
 
         if current_price < params["min_price"] or volume < params["min_volume"]:
@@ -43,9 +44,19 @@ def score_short(snap, params):
 
         price_change_pct = ((current_price - open_price) / open_price) * 100 if open_price else 0
         dist_from_high = ((high_price - current_price) / high_price) * 100 if high_price else 0
+        dist_from_day_low = ((current_price - low_price) / low_price) * 100 if low_price else 0
 
         daily_close = snap["daily_close"]
         recent_change = ((daily_close[-1] - daily_close[0]) / daily_close[0]) * 100 if len(daily_close) >= 2 and daily_close[0] else 0
+
+        # Gap check: a gap-DOWN open still glued to the day's low (no
+        # bounce anywhere in the session) is the textbook "don't chase"
+        # case for a short -- a gap-down that has bounced and is now
+        # rolling over again is the textbook pullback entry instead.
+        gap_pct = ((open_price - daily_close[-1]) / daily_close[-1]) * 100 if len(daily_close) and daily_close[-1] else 0.0
+        is_gap_down = gap_pct < -params["gap_threshold"]
+        gap_chase = is_gap_down and dist_from_day_low < 0.3
+        gap_with_pullback = is_gap_down and not gap_chase
 
         closes = snap["intraday_close"]
         window = params["momentum_window"]
@@ -56,14 +67,30 @@ def score_short(snap, params):
         else:
             momentum_change = 0
 
+        # Volume ratio, corrected for time of day -- see the long mode's
+        # score_long for why comparing to a full-day average understates
+        # the ratio all morning and overstates it all afternoon.
         avg_volume_5d = snap["daily_volume"].mean() if len(snap["daily_volume"]) else 0
-        volume_ratio = volume / avg_volume_5d if avg_volume_5d > 0 else 0
+        elapsed_fraction = sc.session_elapsed_fraction(len(closes))
+        expected_volume_by_now = avg_volume_5d * elapsed_fraction
+        volume_ratio = volume / expected_volume_by_now if expected_volume_by_now > 0 else 0
 
         rsi = indicators.rsi(closes, period=params["rsi_period"])
         atr = indicators.atr(snap["intraday_high"], snap["intraday_low"], closes, period=params["atr_period"])
         atr_pct = (atr / current_price) * 100 if current_price else 0
 
+        # Real support/resistance from 5 days of hourly bars, and the
+        # hourly trend direction -- see score_long's comment for why this
+        # matters more than today's own intraday high.
+        dist_from_resistance = None
+        hourly_trend_pct = None
+        if hourly_ctx is not None and hourly_ctx.get("resistance"):
+            dist_from_resistance = ((hourly_ctx["resistance"] - current_price) / hourly_ctx["resistance"]) * 100
+            hourly_trend_pct = hourly_ctx.get("hourly_trend_pct")
+
         conditions_met = []
+        warnings = []
+
         if price_change_pct < params["price_change_threshold"]:
             conditions_met.append("Down from open")
         elif price_change_pct < 0.5:
@@ -80,6 +107,23 @@ def score_short(snap, params):
             conditions_met.append("RSI overbought")
         if atr_pct > params["atr_threshold"]:
             conditions_met.append("Good volatility")
+
+        if dist_from_resistance is not None and dist_from_resistance < params["dist_from_resistance_threshold"]:
+            conditions_met.append("Near real resistance (hourly)")
+        if hourly_trend_pct is not None:
+            if hourly_trend_pct < -params["hourly_trend_threshold"]:
+                conditions_met.append("Hourly downtrend confirmed")
+            elif hourly_trend_pct > params["hourly_trend_threshold"]:
+                warnings.append("against hourly trend")
+        if index_change_pct is not None:
+            if index_change_pct < 0.1:
+                conditions_met.append("Market supportive (index)")
+            elif index_change_pct > 0.3:
+                warnings.append("against index trend")
+        if gap_with_pullback:
+            conditions_met.append("Gap-down with bounce confirmed")
+        elif gap_chase:
+            warnings.append("gap-down, no bounce (chase risk)")
 
         if len(conditions_met) < params["min_conditions"]:
             return None
@@ -104,15 +148,38 @@ def score_short(snap, params):
         if rsi and rsi > 70: score += 5
         elif rsi and rsi > 65: score += 3
 
+        if dist_from_resistance is not None:
+            if dist_from_resistance < 1: score += 15
+            elif dist_from_resistance < 2: score += 8
+        if hourly_trend_pct is not None and hourly_trend_pct < -params["hourly_trend_threshold"]:
+            score += 10
+        if index_change_pct is not None and index_change_pct < 0.1:
+            score += 5
+        if gap_with_pullback:
+            score += 8
+        if gap_chase:
+            score -= 15
+        if "against hourly trend" in warnings:
+            score -= 10
+        if "against index trend" in warnings:
+            score -= 8
+        score = max(0, score)
+
         if score < params["min_score"]:
             return None
 
+        conditions_text = ", ".join(conditions_met)
+        if warnings:
+            conditions_text += " | ⚠️ " + "; ".join(warnings)
+
         return {
-            "price": current_price, "open": open_price, "high": high_price, "low": snap["day_low"],
+            "price": current_price, "open": open_price, "high": high_price, "low": low_price,
             "change_pct": price_change_pct, "volume": volume, "volume_ratio": volume_ratio,
             "dist_from_high": dist_from_high, "recent_trend": recent_change, "momentum": momentum_change,
             "rsi": rsi if rsi else 0, "atr_pct": atr_pct, "score": score,
-            "conditions": ", ".join(conditions_met),
+            "dist_from_resistance": dist_from_resistance, "hourly_trend_pct": hourly_trend_pct,
+            "index_change_pct": index_change_pct,
+            "conditions": conditions_text,
             "signal_strength": "STRONG" if score >= params["strong_score"] else "MODERATE" if score >= 50 else "WEAK",
         }
     except Exception:
@@ -135,7 +202,7 @@ def render() -> None:
                                      key=sskey(MODE_KEY, "min_price"))
         min_volume = st.number_input("Min Volume", min_value=10000, max_value=10000000, value=100000, step=10000,
                                       key=sskey(MODE_KEY, "min_volume"))
-        min_conditions = st.slider("Min Conditions (out of 7)", 2, 7, 4, key=sskey(MODE_KEY, "min_conditions"))
+        min_conditions = st.slider("Min Conditions (out of 10)", 2, 10, 4, key=sskey(MODE_KEY, "min_conditions"))
         min_score = st.slider("Min Score (0-100)", 20, 90, 50, 5, key=sskey(MODE_KEY, "min_score"))
         min_market_cap_cr = st.number_input(
             "Min Market Cap (₹ Cr)", min_value=0, max_value=1000000, value=0, step=500,
@@ -151,6 +218,18 @@ def render() -> None:
         trend_threshold = st.slider("5-Day Trend (%)", -10.0, 0.0, -2.0, 0.5, key=sskey(MODE_KEY, "trend_th"))
         rsi_threshold = st.slider("RSI Overbought", 50, 80, 65, 5, key=sskey(MODE_KEY, "rsi_th"))
         atr_threshold = st.slider("ATR % Threshold", 0.5, 5.0, 1.0, 0.1, key=sskey(MODE_KEY, "atr_th"))
+        dist_from_resistance_threshold = st.slider(
+            "Dist from Real Resistance (%)", 0.5, 5.0, 2.0, 0.5, key=sskey(MODE_KEY, "dist_resist_th"),
+            help="Support/resistance from 5 days of hourly bars — not today's own intraday high.",
+        )
+        hourly_trend_threshold = st.slider(
+            "Hourly Trend Confirmation (%)", 0.0, 2.0, 0.2, 0.1, key=sskey(MODE_KEY, "hourly_trend_th"),
+            help="Recent 3 hourly closes vs the prior 3. A signal fighting this is flagged, not filtered out.",
+        )
+        gap_threshold = st.slider(
+            "Gap Threshold (%)", 0.5, 5.0, 1.0, 0.5, key=sskey(MODE_KEY, "gap_th"),
+            help="Gap-down opens beyond this, with no bounce anywhere in the session, get penalized as chase risk.",
+        )
 
     with st.sidebar.expander("Technical Indicators & Trading Settings"):
         rsi_period = st.number_input("RSI Period", 5, 50, 14, 1, key=sskey(MODE_KEY, "rsi_period"))
@@ -169,6 +248,8 @@ def render() -> None:
         "atr_threshold": atr_threshold, "rsi_period": rsi_period, "atr_period": atr_period,
         "momentum_window": momentum_window, "strong_score": strong_score,
         "min_market_cap_cr": min_market_cap_cr,
+        "dist_from_resistance_threshold": dist_from_resistance_threshold,
+        "hourly_trend_threshold": hourly_trend_threshold, "gap_threshold": gap_threshold,
     }
     set_state(MODE_KEY, "trading_settings", {"stop_loss_pct": stop_loss_pct, "target_pct": target_pct, "chart_height": chart_height})
 
@@ -176,7 +257,17 @@ def render() -> None:
         snap = sc.bulletproof_fetch(intraday_data.fetch_intraday_snapshot, rec["yf_symbol"])
         if snap is None:
             return "failed", None
-        analysis = score_short(snap, params)
+
+        hourly_ctx = intraday_data.fetch_hourly_context(rec["yf_symbol"])
+        index_change_pct = None
+        index_symbol = sc.INDEX_FOR_EXCHANGE.get(rec["exchange"])
+        if index_symbol:
+            index_snap = sc.bulletproof_fetch(intraday_data.fetch_intraday_snapshot, index_symbol)
+            if index_snap is not None and index_snap.get("intraday_open"):
+                index_change_pct = ((index_snap["intraday_close"][-1] - index_snap["intraday_open"])
+                                     / index_snap["intraday_open"]) * 100
+
+        analysis = score_short(snap, params, hourly_ctx, index_change_pct)
         if analysis is None:
             return "filtered", None
 
@@ -260,7 +351,8 @@ def _render_results() -> None:
         "Price (₹)": r["price"], "Change %": r["change_pct"], "Score": r["score"],
         "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
         "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
-        "Dist from High (%)": r["dist_from_high"], "5D Trend (%)": r["recent_trend"],
+        "Dist from High (%)": r["dist_from_high"], "Dist from Resistance (%)": r.get("dist_from_resistance"),
+        "5D Trend (%)": r["recent_trend"], "Hourly Trend (%)": r.get("hourly_trend_pct"),
         "RSI": r["rsi"], "ATR %": r["atr_pct"], "Conditions": r["conditions"],
     } for r in results])
 
@@ -279,8 +371,8 @@ def _render_results() -> None:
 
     styled = df.style.map(color_signal, subset=["Signal"]).map(color_change, subset=["Change %", "5D Trend (%)"]).format({
         "Price (₹)": "₹{:.2f}", "Change %": "{:+.2f}%", "Volume Ratio": "{:.2f}x",
-        "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from High (%)": "{:.2f}%", "5D Trend (%)": "{:+.2f}%",
-        "RSI": "{:.1f}", "ATR %": "{:.2f}%",
+        "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from High (%)": "{:.2f}%", "Dist from Resistance (%)": "{:.2f}%",
+        "5D Trend (%)": "{:+.2f}%", "Hourly Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
     }, na_rep="—")
     st.dataframe(styled, width="stretch", height=400)
 

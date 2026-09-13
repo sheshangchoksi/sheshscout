@@ -64,6 +64,33 @@ def market_cap_category(market_cap_cr: Optional[float]) -> str:
         return "Mid Cap"
     return "Small Cap"
 
+
+# NSE/BSE cash session is 09:15-15:30 IST = 375 minutes. Comparing a
+# partial day's cumulative volume against a 5-day *full-day* average
+# volume systematically understates the ratio in the morning and
+# inflates it by afternoon -- a real volume burst at 10 AM can get
+# filtered out purely because it's early. Scaling the average down by
+# how much of the session has elapsed fixes that without any extra
+# Yahoo calls (session length is a constant, elapsed bars are already
+# in the snapshot we fetch anyway).
+SESSION_MINUTES = 375
+
+
+def session_elapsed_fraction(n_bars: int) -> float:
+    """Fraction of the trading session elapsed, given the number of 1-min
+    bars fetched so far today. Clamped away from 0 so a fresh-open snapshot
+    (a handful of bars) doesn't blow up the ratio via division by ~0, and
+    capped at 1.0 for anything at/after the close."""
+    return min(1.0, max(0.05, n_bars / SESSION_MINUTES))
+
+
+# Broad-market index to check for directional agreement, per exchange.
+# Sector-index confirmation (checking e.g. CNXPHARMA/CNXAUTO specifically)
+# would need a symbol->sector mapping this codebase doesn't have (the
+# universe CSVs are just symbol+name), so this stays at the broad-market
+# level for now rather than pretending to a sector check it can't do.
+INDEX_FOR_EXCHANGE = {"NSE": "^NSEI", "BSE": "^BSESN"}
+
 _HERE = Path(__file__).parent
 _NSE_CSV = _HERE / "nse_tickers.csv"
 _BSE_CSV = _HERE / "bse_codes.csv"
