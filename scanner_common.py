@@ -1,10 +1,11 @@
 """
-scanner_common.py — Everything the two intraday modes (Long / Short) share:
-universe loading (NSE tickers + BSE codes -> yfinance symbols), the
-exchange / scan-mode / rate-limit sidebar controls, a thread-safe
-process-wide cache + dead-symbol registry, a retry wrapper around every
-external call, checkpointed scanning, and small UI helpers (download
-buttons, footer).
+scanner_common.py — Everything all four scoring modes (Intraday Long/Short,
+Swing Long/Short) share: universe loading (NSE tickers + BSE codes ->
+yfinance symbols), the exchange / scan-mode / rate-limit sidebar controls,
+a thread-safe process-wide cache + dead-symbol registry, a retry wrapper
+around every external call, checkpointed scanning, trade-levels math +
+trade-card / conditions-checklist / price-volume-RSI-chart rendering, and
+small UI helpers (download buttons, footer).
 
 Deployment target is Streamlit Community Cloud's free tier: shared CPU,
 ~1GB RAM, one process that may serve more than one browser session. That
@@ -36,6 +37,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 try:
@@ -48,6 +50,8 @@ else:
 
 MODE_LONG = "long"
 MODE_SHORT = "short"
+MODE_SWING_LONG = "swing_long"
+MODE_SWING_SHORT = "swing_short"
 
 # Rough, rule-of-thumb Indian market-cap bands (₹ Cr) shared by both modes
 # so "Large/Mid/Small Cap" means the same thing regardless of screener.
@@ -542,6 +546,183 @@ def run_scan(mode_key: str, stocks_to_scan: list[dict], fetch_and_analyze: Calla
             # now stale and misleading -- erase it rather than leave a
             # "Resume" button sitting next to a "Scan complete" message.
             resume_placeholder.empty()
+
+
+# --------------------------------------------------------------------- #
+# Trade-levels math + trade-card / conditions-checklist rendering, shared
+# by every scoring mode (Intraday Long/Short, Swing Long/Short) so this
+# exists exactly once instead of drifting copies per mode.
+# --------------------------------------------------------------------- #
+def trade_levels(price: float, direction: str, support_level, resistance_level,
+                  stop_loss_pct: float, target_pct: float) -> dict:
+    """Stop/target/risk/reward for one result. direction "long": stop is
+    BELOW entry (real support when it's actually below entry, else the
+    fixed-% fallback), target is ABOVE entry (real resistance, same rule).
+    direction "short" is the mirror image.
+
+    Using a fixed % for both regardless of the stock makes the R:R ratio
+    ALWAYS target_pct/stop_loss_pct -- literally identical for every
+    result, since price cancels out of that division. Real support/
+    resistance (already fetched for scoring) gives a per-stock stop/target
+    instead, each only used when it's on the correct side of entry --
+    otherwise this falls back to the fixed-% behavior."""
+    if direction == "long":
+        used_real_stop = support_level is not None and support_level < price
+        used_real_target = resistance_level is not None and resistance_level > price
+        stop_loss = support_level if used_real_stop else price * (1 - stop_loss_pct / 100)
+        target = resistance_level if used_real_target else price * (1 + target_pct / 100)
+    else:
+        used_real_stop = resistance_level is not None and resistance_level > price
+        used_real_target = support_level is not None and support_level < price
+        stop_loss = resistance_level if used_real_stop else price * (1 + stop_loss_pct / 100)
+        target = support_level if used_real_target else price * (1 - target_pct / 100)
+    risk = abs(price - stop_loss)
+    reward = abs(target - price)
+    return {
+        "stop_loss": stop_loss, "target": target,
+        "used_real_stop": used_real_stop, "used_real_target": used_real_target,
+        "risk": risk, "reward": reward,
+        "risk_pct": (risk / price) * 100 if price else 0,
+        "reward_pct": (reward / price) * 100 if price else 0,
+        "risk_reward": reward / risk if risk > 0 else 0,
+    }
+
+
+def render_trade_card(result: dict, trading: dict, direction: str, *, same_session_exit: bool = True,
+                       distant_target_threshold_pct: float = 3.0, atr_key: str = "atr") -> dict:
+    """Entry/Stop/Target/R:R, risk-reward in ₹ and %, an ATR sanity check
+    on the stop, and a position-size suggestion for the sidebar's risk
+    budget -- identical across every mode, so it exists exactly once.
+    Returns the underlying trade_levels() dict (the summary table's R:R
+    column calls trade_levels() directly instead, to avoid re-rendering).
+
+    same_session_exit controls the "target is unrealistically far away"
+    caveat: True (intraday) assumes the position closes before the session
+    ends, so a real S/R target more than distant_target_threshold_pct away
+    is flagged as unlikely to be hit today. False (swing) skips that
+    caveat entirely -- a real target several % away is the point of a
+    multi-day/week hold, not a red flag.
+    """
+    lv = trade_levels(result["price"], direction, result.get("support_level"), result.get("resistance_level"),
+                       trading["stop_loss_pct"], trading["target_pct"])
+    stop_level_name = "support" if direction == "long" else "resistance"
+    target_level_name = "resistance" if direction == "long" else "support"
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.info(f"💡 Entry: ₹{result['price']:.2f}")
+    t2.error(f"🛑 Stop: ₹{lv['stop_loss']:.2f}" + (f" (real {stop_level_name})" if lv["used_real_stop"] else ""))
+    t3.success(f"🎯 Target: ₹{lv['target']:.2f}" + (f" (real {target_level_name})" if lv["used_real_target"] else ""))
+    t4.metric("R:R Ratio", f"1:{lv['risk_reward']:.2f}")
+
+    risk_per_trade = trading.get("risk_per_trade", 1000)
+    suggested_qty = int(risk_per_trade // lv["risk"]) if lv["risk"] > 0 else 0
+    position_value = suggested_qty * result["price"]
+    atr_value = result.get(atr_key, 0) or 0
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric("Risk / share", f"₹{lv['risk']:.2f}", f"{lv['risk_pct']:.2f}% of entry", delta_color="off")
+    u2.metric("Reward / share", f"₹{lv['reward']:.2f}", f"{lv['reward_pct']:.2f}% of entry", delta_color="off")
+    if atr_value <= 0:
+        u3.metric("ATR", "—", "not enough price history yet", delta_color="off")
+    elif lv["risk"] < atr_value * 0.5:
+        u3.metric("ATR", f"₹{atr_value:.2f}", "stop tighter than typical noise ⚠️", delta_color="off")
+    elif lv["risk"] > atr_value * 3:
+        u3.metric("ATR", f"₹{atr_value:.2f}", "stop much wider than ATR", delta_color="off")
+    else:
+        u3.metric("ATR", f"₹{atr_value:.2f}", "stop is a reasonable multiple of ATR", delta_color="off")
+    u4.metric(f"Qty for ₹{risk_per_trade:,.0f} risk", f"{suggested_qty:,} sh", f"≈ ₹{position_value:,.0f} position", delta_color="off")
+
+    if same_session_exit and lv["used_real_target"] and lv["reward_pct"] > distant_target_threshold_pct:
+        st.caption(f"🕒 Target is {lv['reward_pct']:.1f}% away — that's a large move for a single session; "
+                   f"the R:R above assumes it gets hit today, which may not happen. Consider a nearer "
+                   f"partial target or trailing the stop instead of holding for the full move.")
+
+    return lv
+
+
+def render_conditions_checklist(result: dict) -> None:
+    """The conditions-met checklist + a separate warnings box, identical
+    across every mode. Reads result["conditions_list"] / ["warnings_list"]
+    -- kept alongside the single joined "conditions" string each score_*()
+    also returns (that string is what the summary table's one-column
+    display uses)."""
+    st.markdown("**✅ Conditions met**")
+    st.markdown("\n".join(f"- {c}" for c in result.get("conditions_list", [])) or "_none_")
+    if result.get("warnings_list"):
+        st.warning("⚠️ " + "; ".join(result["warnings_list"]))
+
+
+def render_price_volume_rsi_charts(result: dict, chart_data: Optional[pd.DataFrame],
+                                    chart_timeframe: str, chart_height: int,
+                                    price_color: str = "#28a745", rsi_color: str = "#007bff") -> None:
+    """The Price / Volume / RSI three-chart row shown in every mode's
+    detail view -- identical across Intraday and Swing (Long/Short), so it
+    exists exactly once. `chart_data` is whatever a mode's chart-history
+    fetch returned (a plain OHLCV DataFrame); the RSI here is a lightweight
+    from-scratch calc for the chart display only (NOT indicators.rsi(),
+    which is Wilder-smoothed and used for actual scoring) -- see the
+    branching below for why "no losses" and "no gains" need separate
+    RSI-100 / RSI-0 cases rather than collapsing both into one "rs=0"
+    branch.
+
+    price_color/rsi_color default to the Long screeners' green/blue; the
+    Short screeners pass red/green instead -- a deliberate visual cue
+    ("this is a short") worth keeping distinct rather than flattening
+    every mode to identical colors for the sake of sharing this function.
+    """
+    if chart_data is None or chart_data.empty:
+        st.warning(f"No chart data available for {result['symbol']}")
+        return
+
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        fig1 = go.Figure()
+        fig1.add_trace(go.Scatter(x=chart_data.index, y=chart_data["Close"], mode="lines", name="Price",
+                                   line=dict(color=price_color, width=2)))
+        fig1.add_hline(y=result["open"], line_dash="dash", line_color="gray", line_width=1, annotation_text="Open")
+        fig1.update_layout(title=f"Price Chart ({chart_timeframe})", xaxis_title="Time", yaxis_title="Price (₹)",
+                            height=chart_height, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+        st.plotly_chart(fig1, width="stretch")
+    with cc2:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(x=chart_data.index, y=chart_data["Volume"], name="Volume", marker_color="#17a2b8"))
+        fig2.update_layout(title=f"Volume ({chart_timeframe})", xaxis_title="Time", yaxis_title="Volume",
+                            height=chart_height, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+        st.plotly_chart(fig2, width="stretch")
+    with cc3:
+        closes = chart_data["Close"].values
+        rsi_vals, rsi_idx = [], []
+        for j in range(14, len(closes)):
+            window = closes[max(0, j - 14):j]
+            if len(window) > 1:
+                diffs = window[1:] - window[:-1]
+                gains = diffs[diffs > 0].sum() / len(window)
+                losses = -diffs[diffs < 0].sum() / len(window)
+                # rs=0 legitimately means "no losses in the window" only
+                # when there WERE gains (-> RSI should read 100, maximal
+                # overbought); it's a different, opposite case when there
+                # were also no gains (flat window -> RSI 50). Collapsing
+                # both into one "rs=0" branch misreports a strongly
+                # up-trending window (all gains, zero losses) as neutral
+                # RSI 50 instead of 100 -- and symmetrically, an all-losses
+                # window as 50 instead of 0.
+                if losses == 0 and gains == 0:
+                    rsi_val = 50.0
+                elif losses == 0:
+                    rsi_val = 100.0
+                elif gains == 0:
+                    rsi_val = 0.0
+                else:
+                    rsi_val = 100 - (100 / (1 + gains / losses))
+                rsi_vals.append(rsi_val)
+                rsi_idx.append(chart_data.index[j])
+        fig3 = go.Figure()
+        if rsi_vals:
+            fig3.add_trace(go.Scatter(x=rsi_idx, y=rsi_vals, mode="lines", name="RSI", line=dict(color=rsi_color, width=2)))
+            fig3.add_hline(y=70, line_dash="dash", line_color="red", line_width=1)
+            fig3.add_hline(y=30, line_dash="dash", line_color="green", line_width=1)
+        fig3.update_layout(title=f"RSI ({chart_timeframe})", xaxis_title="Time", yaxis_title="RSI",
+                            height=chart_height, margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
+        st.plotly_chart(fig3, width="stretch")
 
 
 # --------------------------------------------------------------------- #

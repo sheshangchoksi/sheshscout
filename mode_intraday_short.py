@@ -13,7 +13,6 @@ every other mode.
 from __future__ import annotations
 
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 
 import candlesticks
@@ -223,27 +222,10 @@ def score_short(snap, params, hourly_ctx=None, index_change_pct=None):
 
 
 def _trade_levels(result: dict, trading: dict) -> dict:
-    """Stop/target/risk/reward for one result -- see score_long's version
-    for the full rationale. SHORT: stop is ABOVE entry (real resistance
-    when it's actually above entry, else the fixed-% fallback), target is
-    BELOW entry (real support, same rule)."""
-    price = result["price"]
-    resistance_level = result.get("resistance_level")
-    support_level = result.get("support_level")
-    used_real_stop = resistance_level is not None and resistance_level > price
-    used_real_target = support_level is not None and support_level < price
-    stop_loss = resistance_level if used_real_stop else price * (1 + trading["stop_loss_pct"] / 100)
-    target = support_level if used_real_target else price * (1 - trading["target_pct"] / 100)
-    risk = abs(stop_loss - price)
-    reward = abs(price - target)
-    return {
-        "stop_loss": stop_loss, "target": target,
-        "used_real_stop": used_real_stop, "used_real_target": used_real_target,
-        "risk": risk, "reward": reward,
-        "risk_pct": (risk / price) * 100 if price else 0,
-        "reward_pct": (reward / price) * 100 if price else 0,
-        "risk_reward": reward / risk if risk > 0 else 0,
-    }
+    """Thin wrapper around scanner_common.trade_levels() -- see
+    mode_intraday_long's identical comment."""
+    return sc.trade_levels(result["price"], "short", result.get("support_level"), result.get("resistance_level"),
+                            trading["stop_loss_pct"], trading["target_pct"])
 
 
 # ── UI ───────────────────────────────────────────────────────────────────
@@ -501,97 +483,16 @@ def _render_results() -> None:
     chart_data = intraday_data.fetch_chart_history(result["yf_symbol"], period, interval)
     trading = get_state(MODE_KEY, "trading_settings", {"stop_loss_pct": 0.5, "target_pct": 2.0, "chart_height": 250})
 
-    if chart_data is not None and not chart_data.empty:
-        cc1, cc2, cc3 = st.columns(3)
-        with cc1:
-            fig1 = go.Figure()
-            fig1.add_trace(go.Scatter(x=chart_data.index, y=chart_data["Close"], mode="lines", name="Price",
-                                       line=dict(color="#dc3545", width=2)))
-            fig1.add_hline(y=result["open"], line_dash="dash", line_color="gray", line_width=1, annotation_text="Open")
-            fig1.update_layout(title=f"Price Chart ({chart_timeframe})", xaxis_title="Time", yaxis_title="Price (₹)",
-                                height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig1, width="stretch")
-        with cc2:
-            fig2 = go.Figure()
-            fig2.add_trace(go.Bar(x=chart_data.index, y=chart_data["Volume"], name="Volume", marker_color="#17a2b8"))
-            fig2.update_layout(title=f"Volume ({chart_timeframe})", xaxis_title="Time", yaxis_title="Volume",
-                                height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig2, width="stretch")
-        with cc3:
-            closes = chart_data["Close"].values
-            rsi_vals, rsi_idx = [], []
-            for j in range(14, len(closes)):
-                window = closes[max(0, j - 14):j]
-                if len(window) > 1:
-                    diffs = window[1:] - window[:-1]
-                    gains = diffs[diffs > 0].sum() / len(window)
-                    losses = -diffs[diffs < 0].sum() / len(window)
-                    # See score_long's chart-RSI comment: rs=0 conflated
-                    # "no losses" (should read 100) with "no gains" (should
-                    # read 0) into the same neutral-50 result. Fixed the same
-                    # way here.
-                    if losses == 0 and gains == 0:
-                        rsi_val = 50.0
-                    elif losses == 0:
-                        rsi_val = 100.0
-                    elif gains == 0:
-                        rsi_val = 0.0
-                    else:
-                        rsi_val = 100 - (100 / (1 + gains / losses))
-                    rsi_vals.append(rsi_val)
-                    rsi_idx.append(chart_data.index[j])
-            fig3 = go.Figure()
-            if rsi_vals:
-                fig3.add_trace(go.Scatter(x=rsi_idx, y=rsi_vals, mode="lines", name="RSI", line=dict(color="#28a745", width=2)))
-                fig3.add_hline(y=70, line_dash="dash", line_color="red", line_width=1)
-                fig3.add_hline(y=30, line_dash="dash", line_color="green", line_width=1)
-            fig3.update_layout(title=f"RSI ({chart_timeframe})", xaxis_title="Time", yaxis_title="RSI",
-                                height=trading["chart_height"], margin=dict(l=20, r=20, t=40, b=20), showlegend=False)
-            st.plotly_chart(fig3, width="stretch")
-    else:
-        st.warning(f"No chart data available for {result['symbol']}")
+    # Red/green here (not the Long screener's green/blue) is a deliberate
+    # visual cue that this is a SHORT -- see sc.render_price_volume_rsi_charts()'s
+    # docstring.
+    sc.render_price_volume_rsi_charts(result, chart_data, chart_timeframe, trading["chart_height"],
+                                       price_color="#dc3545", rsi_color="#28a745")
 
-    # SHORT: stop loss is ABOVE entry, target is BELOW entry -- levels come
-    # from the shared _trade_levels() helper (see its docstring / score_long's
-    # for the full rationale on why a fixed % for both used to make every
-    # result's R:R ratio identical).
-    lv = _trade_levels(result, trading)
-    stop_loss, target = lv["stop_loss"], lv["target"]
-    t1, t2, t3, t4 = st.columns(4)
-    t1.info(f"💡 Entry: ₹{result['price']:.2f}")
-    t2.error(f"🛑 Stop: ₹{stop_loss:.2f}" + (" (real resistance)" if lv["used_real_stop"] else ""))
-    t3.success(f"🎯 Target: ₹{target:.2f}" + (" (real support)" if lv["used_real_target"] else ""))
-    t4.metric("R:R Ratio", f"1:{lv['risk_reward']:.2f}")
-
-    # Risk/reward in ₹ and %, an ATR sanity check on the stop, and a
-    # position-size suggestion for the risk budget set in the sidebar.
-    risk_per_trade = trading.get("risk_per_trade", 1000)
-    suggested_qty = int(risk_per_trade // lv["risk"]) if lv["risk"] > 0 else 0
-    position_value = suggested_qty * result["price"]
-    u1, u2, u3, u4 = st.columns(4)
-    u1.metric("Risk / share", f"₹{lv['risk']:.2f}", f"{lv['risk_pct']:.2f}% of entry", delta_color="off")
-    u2.metric("Reward / share", f"₹{lv['reward']:.2f}", f"{lv['reward_pct']:.2f}% of entry", delta_color="off")
-    if result["atr"] <= 0:
-        u3.metric("ATR", "—", "not enough intraday data yet", delta_color="off")
-    elif lv["risk"] < result["atr"] * 0.5:
-        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop tighter than typical noise ⚠️", delta_color="off")
-    elif lv["risk"] > result["atr"] * 3:
-        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop much wider than ATR", delta_color="off")
-    else:
-        u3.metric("ATR", f"₹{result['atr']:.2f}", "stop is a reasonable multiple of ATR", delta_color="off")
-    u4.metric(f"Qty for ₹{risk_per_trade:,.0f} risk", f"{suggested_qty:,} sh", f"≈ ₹{position_value:,.0f} position", delta_color="off")
-
-    # See mode_intraday_long's identical comment: a real support level can
-    # sit far below entry (an old swing low), which is technically real but
-    # not a realistic same-session target for an intraday screener.
-    if lv["used_real_target"] and lv["reward_pct"] > 3:
-        st.caption(f"🕒 Target is {lv['reward_pct']:.1f}% away — that's a large move for a single session; "
-                   f"the R:R above assumes it gets hit today, which may not happen. Consider a nearer "
-                   f"partial target or trailing the stop instead of holding for the full move.")
-
-    st.markdown("**✅ Conditions met**")
-    st.markdown("\n".join(f"- {c}" for c in result.get("conditions_list", [])) or "_none_")
-    if result.get("warnings_list"):
-        st.warning("⚠️ " + "; ".join(result["warnings_list"]))
+    # SHORT: stop loss is ABOVE entry, target is BELOW entry. Rendered by
+    # the shared sc.render_trade_card() -- see its docstring / score_long's
+    # for the full rationale.
+    sc.render_trade_card(result, trading, "short", same_session_exit=True)
+    sc.render_conditions_checklist(result)
 
     sc.download_buttons(MODE_KEY, df, df, "intraday_short_scan")

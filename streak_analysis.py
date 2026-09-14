@@ -10,10 +10,16 @@ close history, independently of whatever made that symbol show up in the
 scan results in the first place.
 
 Data cost: one plain daily-history fetch, and ONLY for whichever single
-stock is currently selected in the detail view (same "only the selected
+stock is currently selected in a detail view (same "only the selected
 symbol pays for it" rule fetch_chart_history already follows) -- never
 across the whole results table, so this doesn't multiply Yahoo calls per
 scan the way anything in the per-symbol scan loop would.
+
+fetch_daily_history() below is also reused by swing_data.py for the two
+swing modes' actual scoring data (not just this file's own streak box) --
+one fetch and one cache entry per (symbol, period) serves both, so
+looking at a stock's streak box and then switching to a swing scan on the
+same stock (or vice versa) doesn't pay for its daily history twice.
 """
 
 from __future__ import annotations
@@ -31,7 +37,7 @@ from scanner_common import yf
 # script on each one).
 _DAILY_HIST_CACHE_TTL_S = 6 * 3600
 
-_PERIOD_LABELS = {"6 Months": "6mo", "1 Year": "1y", "2 Years": "2y", "3 Years": "3y", "5 Years": "5y"}
+PERIOD_LABELS = {"6 Months": "6mo", "1 Year": "1y", "2 Years": "2y", "3 Years": "3y", "5 Years": "5y"}
 _WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
 
 
@@ -172,11 +178,11 @@ def render_streak_highlight(result: dict, mode_key: str) -> None:
         h1, h2 = st.columns([3, 1])
         h1.markdown("##### 📅 Historical Streak Pattern *(info only — not part of the score)*")
         lookback_label = h2.selectbox(
-            "Lookback", list(_PERIOD_LABELS.keys()), index=1,
+            "Lookback", list(PERIOD_LABELS.keys()), index=1,
             key=sc.sskey(mode_key, f"streak_lookback_{result['yf_symbol']}"), label_visibility="collapsed",
         )
 
-        hist = fetch_daily_history(result["yf_symbol"], _PERIOD_LABELS[lookback_label])
+        hist = fetch_daily_history(result["yf_symbol"], PERIOD_LABELS[lookback_label])
         if hist is None:
             st.caption("Couldn't fetch daily history for this stock right now.")
             return

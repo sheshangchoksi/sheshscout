@@ -10,6 +10,11 @@ it once, here, means:
   • a single short-TTL cache shared by both modes, so running Short then
     Long back-to-back on an overlapping universe doesn't double Yahoo's
     load for data that's already sitting in memory
+
+fetch_shares_outstanding() below is the one exception to the "intraday"
+framing in this file's name: shares outstanding doesn't depend on any
+timeframe, so the two swing modes (mode_swing_long.py / mode_swing_short.py)
+reuse it too rather than duplicating a second shares-outstanding fetcher.
 """
 
 from __future__ import annotations
