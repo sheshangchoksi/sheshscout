@@ -245,6 +245,7 @@ def render() -> None:
     scan_nse, scan_bse, universe = sc.render_exchange_selector(MODE_KEY)
     stocks_to_scan = sc.render_scan_mode_selector(MODE_KEY, universe)
     rate_cfg = sc.render_rate_limit_controls(MODE_KEY)
+    strict_mode = sc.render_strict_mode_toggle(MODE_KEY)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("⚙️ Screening Parameters")
@@ -319,6 +320,8 @@ def render() -> None:
         "hourly_trend_threshold": hourly_trend_threshold, "gap_threshold": gap_threshold,
         "candle_lookback": candle_lookback,
     }
+    if strict_mode:
+        params = sc.apply_strict_screening(params, "long")
     set_state(MODE_KEY, "trading_settings", {
         "stop_loss_pct": stop_loss_pct, "target_pct": target_pct,
         "risk_per_trade": risk_per_trade, "chart_height": chart_height,
@@ -361,6 +364,21 @@ def render() -> None:
 
         analysis["market_cap_cr"] = market_cap_cr
         analysis["market_cap_category"] = sc.market_cap_category(market_cap_cr)
+
+        # Purely informational "unusual activity" flag -- see
+        # sc.assess_operator_risk()'s docstring. Never affects score,
+        # conditions, gating, or sorting; only shown in the table/detail
+        # view for the person's own judgement. change_pct here is today's
+        # single-session move, so the extreme/moderate bar is calibrated
+        # for a same-day scale (an 8%+ single-session move is already a
+        # lot, unlike a multi-day swing move).
+        op_risk = sc.assess_operator_risk(
+            price=analysis["price"], market_cap_cr=market_cap_cr, volume_ratio=analysis["volume_ratio"],
+            change_pct=analysis["change_pct"], change_pct_extreme=8.0, change_pct_moderate=4.0,
+        )
+        analysis["operated_flag"] = "Operated" if op_risk["flagged"] else None
+        analysis["operated_reasons"] = op_risk["reasons"]
+
         analysis.update({"symbol": rec["symbol"], "name": rec["name"], "yf_symbol": rec["yf_symbol"], "exchange": rec["exchange"]})
         return "ok", analysis
 
@@ -441,6 +459,7 @@ def _render_results() -> None:
         "Price (₹)": r["price"], "Change %": r["change_pct"], "Score": r["score"],
         "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
         "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
+        "Flag": r.get("operated_flag"),
         "Dist from Low (%)": r["dist_from_low"], "Dist from Support (%)": r.get("dist_from_support"),
         "Support (₹)": r.get("support_level"), "Resistance (₹)": r.get("resistance_level"),
         "R:R": _trade_levels(r, trading_defaults)["risk_reward"] or None,
@@ -462,7 +481,11 @@ def _render_results() -> None:
         except Exception:
             return ""
 
-    styled = df.style.map(color_signal, subset=["Signal"]).map(color_change, subset=["Change %", "5D Trend (%)"]).format({
+    def color_flag(val):
+        return "background-color: #f8d7da; font-weight: 600" if val == "Operated" else ""
+
+    styled = df.style.map(color_signal, subset=["Signal"]).map(color_change, subset=["Change %", "5D Trend (%)"]) \
+        .map(color_flag, subset=["Flag"]).format({
         "Price (₹)": "₹{:.2f}", "Change %": "{:+.2f}%", "Volume Ratio": "{:.2f}x",
         "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from Low (%)": "{:.2f}%", "Dist from Support (%)": "{:.2f}%",
         "Support (₹)": "₹{:.2f}", "Resistance (₹)": "₹{:.2f}", "R:R": "1:{:.2f}",
@@ -486,6 +509,7 @@ def _render_results() -> None:
     result = results[idx_by_option[selected_option]]
 
     st.markdown(f"##### {result['symbol']} — {result['signal_strength']} (Score: {result['score']})")
+    sc.render_operator_flag_notice(result)
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Price", f"₹{result['price']:.2f}", f"{result['change_pct']:.2f}%")
     m2.metric("Day Range", f"₹{result['low']:.2f} – ₹{result['high']:.2f}")

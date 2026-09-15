@@ -651,6 +651,209 @@ def render_conditions_checklist(result: dict) -> None:
         st.warning("⚠️ " + "; ".join(result["warnings_list"]))
 
 
+# --------------------------------------------------------------------- #
+# Strictest Screening + "Operated" activity flag -- both shared across
+# every mode. Deliberately kept as two INDEPENDENT features: strict mode
+# only tightens score/condition thresholds; the operator flag is purely
+# informational and never gates, sorts, or filters anything, however
+# strict the screening is set to.
+# --------------------------------------------------------------------- #
+def render_strict_mode_toggle(mode_key: str) -> bool:
+    """A single checkbox that raises the floor on a curated set of
+    well-known threshold keys at once, instead of a person having to hunt
+    through every slider individually to ask for "only the best setups."
+    Returns whether it's checked; the caller applies apply_strict_screening()
+    to its own already-assembled params dict."""
+    st.sidebar.markdown("---")
+    return st.sidebar.checkbox(
+        "🏆 Strictest Screening (cream only)", value=False, key=sskey(mode_key, "strict_mode"),
+        help="Raises a curated set of thresholds at once instead of one slider at a time: "
+             "near-full condition confluence, a much higher score bar, real S/R proximity "
+             "within 1.5%, a bigger volume/trend/momentum requirement, tighter RSI, and a "
+             "higher market-cap/liquidity floor -- small, thinly-traded names are exactly "
+             "where the 'Operated' flag below concentrates, per the research this feature is "
+             "based on. Every slider above still works underneath this; strict mode only "
+             "raises the floor, it never loosens a stricter setting you've already made "
+             "yourself. Does NOT touch the Operated flag -- that stays purely informational "
+             "regardless of this setting.",
+    )
+
+
+def apply_strict_screening(params: dict, direction: str) -> dict:
+    """Tightens a fixed set of well-known threshold keys -- only the ones
+    actually present in the given params dict, so this one function works
+    unmodified across Intraday and Swing, Long and Short, without needing
+    to know which mode called it beyond the long/short RSI direction.
+    Returns a NEW dict; never mutates the one passed in, since the
+    original is what's still shown in the sidebar as what the person
+    actually configured with their own sliders.
+
+    Every floor below is a MAX/MIN against the person's own setting (via
+    the tighten_min/tighten_max helpers), so a slider already stricter
+    than the floor is left alone -- this can only raise the bar, never
+    quietly loosen one the person set themselves.
+    """
+    p = dict(params)
+
+    def tighten_min(key, floor):
+        if key in p:
+            p[key] = max(p[key], floor)
+
+    def tighten_max(key, ceiling):
+        if key in p:
+            p[key] = min(p[key], ceiling)
+
+    # Overall bar: near-full confluence of conditions, not just "enough".
+    tighten_min("min_score", 75)
+    tighten_min("strong_score", 80)
+    tighten_min("min_conditions", 9)
+
+    # Liquidity/size floor -- every source behind the Operated flag agrees
+    # small, illiquid names are where manipulation concentrates; "cream
+    # only" means leaning away from that end of the universe by
+    # construction, not just scoring around it after the fact.
+    tighten_min("min_market_cap_cr", 300)
+    tighten_min("min_price", 50)
+    tighten_min("min_volume", 300000)
+
+    # Confirmation quality: real S/R proximity, higher-timeframe trend
+    # agreement, and volume all need to clear a markedly higher bar than
+    # the default "acceptable" one.
+    tighten_max("dist_from_support_threshold", 1.5)
+    tighten_max("dist_from_resistance_threshold", 1.5)
+    tighten_max("dist_from_low_threshold", 2.0)
+    tighten_max("dist_from_high_threshold", 2.0)
+    tighten_min("volume_ratio_threshold", 1.8)
+    tighten_min("trend_threshold", 6.0)
+    tighten_min("momentum_threshold", 1.5)
+    tighten_min("hourly_trend_threshold", 0.3)
+    tighten_min("weekly_trend_threshold", 1.5)
+    if "atr_threshold" in p and p["atr_threshold"] > 0:
+        p["atr_threshold"] = max(p["atr_threshold"], p["atr_threshold"] * 1.3)
+
+    # RSI is direction-aware: "long" wants a LOWER (more oversold) ceiling,
+    # "short" wants a HIGHER (more overbought) floor.
+    if "rsi_threshold" in p:
+        p["rsi_threshold"] = min(p["rsi_threshold"], 28) if direction == "long" else max(p["rsi_threshold"], 72)
+
+    return p
+
+
+def detect_sideways_then_spike(closes, lookback_window: int) -> bool:
+    """One of the most specifically-named operator patterns across the
+    sources behind assess_operator_risk(): a stock trades in a tight range
+    for weeks/months, then suddenly wakes up. Approximated here as "recent
+    daily-return volatility is much higher than an unusually QUIET longer
+    baseline period" -- a real breakout from genuine multi-week
+    consolidation can look similar, which is exactly why this is one
+    input into a multi-signal flag below, not a standalone verdict.
+    Swing-only (needs real daily history; the intraday screener's daily
+    reference window is too short -- a handful of days -- to judge "quiet
+    for weeks"). Never raises; returns False on insufficient data."""
+    try:
+        closes = np.asarray(closes, dtype=float)
+        baseline_len = lookback_window * 3
+        if len(closes) < baseline_len + 5:
+            return False
+        daily_rets_pct = np.diff(closes) / closes[:-1] * 100
+        recent_std = float(np.std(daily_rets_pct[-5:]))
+        baseline_std = float(np.std(daily_rets_pct[-baseline_len:-5]))
+        return bool(baseline_std > 0 and baseline_std < 1.5 and recent_std > baseline_std * 3)
+    except Exception:
+        return False
+
+
+def assess_operator_risk(price, market_cap_cr, volume_ratio, change_pct,
+                          change_pct_extreme: float, change_pct_moderate: float,
+                          sideways_then_spike: bool = False) -> dict:
+    """Heuristic-only 'unusual activity' flag, purely informational: it
+    never filters, sorts, or scores a result, it only labels one for a
+    person's own judgement (per the person's own framing: operator-driven
+    stocks aren't automatically bad, they're just worth knowing about).
+
+    Draws on patterns consistently named across public sources on Indian
+    operator-driven stocks: abnormal volume spikes, outsized price moves
+    without proportional justification, small/illiquid market cap (every
+    source agrees large caps have too much depth for a single operator to
+    move the way a small-cap can), and a long quiet period followed by a
+    sudden spike. NOT a determination of manipulation or wrongdoing --
+    many legitimate rallies (real news, a genuine re-rating) look
+    identical from price/volume data alone, which is exactly why this
+    requires two or more corroborating signals rather than firing on any
+    one metric in isolation, and why small-cap status alone never
+    triggers it (it only lowers how much OTHER evidence is required).
+
+    change_pct_extreme/change_pct_moderate let each mode calibrate what
+    counts as an outsized move on ITS OWN timeframe -- an intraday
+    same-session move and a multi-day swing move aren't the same scale.
+
+    (Sources: strike.money/stock-market/operators; Business Standard's
+    "How to Identify an operator-driven stock"; mentoradityajain.com's
+    "sideways then sudden spike" pattern.)
+    """
+    try:
+        signals = 0
+        reasons = []
+
+        if volume_ratio is not None:
+            if volume_ratio > 5:
+                signals += 2
+                reasons.append(f"volume {volume_ratio:.1f}x average")
+            elif volume_ratio > 3:
+                signals += 1
+                reasons.append(f"volume {volume_ratio:.1f}x average")
+
+        abs_change = abs(change_pct) if change_pct is not None else 0
+        if abs_change > change_pct_extreme:
+            signals += 2
+            reasons.append(f"{abs_change:.1f}% move")
+        elif abs_change > change_pct_moderate:
+            signals += 1
+            reasons.append(f"{abs_change:.1f}% move")
+
+        if price is not None and price < 30 and volume_ratio is not None and volume_ratio > 2:
+            signals += 1
+            reasons.append("low price + volume spike")
+
+        if sideways_then_spike:
+            signals += 2
+            reasons.append("quiet for weeks, then a sudden spike")
+
+        # Market cap sets the BAR, not the score -- the same volume/price
+        # anomaly is common and often perfectly legitimate in a large,
+        # deep stock, precisely because a single operator can't move one
+        # the way they can a small-cap. So the same behavior in a big
+        # stock needs much more corroborating evidence before it's flagged.
+        if market_cap_cr is None:
+            threshold = 4
+        elif market_cap_cr < 100:
+            threshold = 2
+        elif market_cap_cr < 500:
+            threshold = 3
+        else:
+            threshold = 5
+
+        return {"flagged": signals >= threshold, "signals": signals, "threshold": threshold, "reasons": reasons}
+    except Exception:
+        return {"flagged": False, "signals": 0, "threshold": 99, "reasons": []}
+
+
+def render_operator_flag_notice(result: dict) -> None:
+    """The detail-view explanation for a flagged result -- kept separate
+    from the summary table's compact "Operated" label so the table stays
+    scannable while the detail view gets the actual reasoning."""
+    if not result.get("operated_flag"):
+        return
+    reasons = ", ".join(result.get("operated_reasons", [])) or "multiple signals"
+    st.warning(
+        f"🚩 **Flagged: possible unusual activity** ({reasons}). This is a heuristic based on "
+        f"volume/price/market-cap patterns commonly associated with operator-driven stocks -- "
+        f"**not proof of manipulation**. Many legitimate rallies look similar, and operator "
+        f"activity isn't automatically something to avoid; it's just worth knowing about before "
+        f"sizing the trade."
+    )
+
+
 def render_price_volume_rsi_charts(result: dict, chart_data: Optional[pd.DataFrame],
                                     chart_timeframe: str, chart_height: int,
                                     price_color: str = "#28a745", rsi_color: str = "#007bff") -> None:
