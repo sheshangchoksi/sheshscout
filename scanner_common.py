@@ -31,7 +31,7 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -186,23 +186,39 @@ def compute_beta(stock_closes, index_closes) -> Optional[float]:
         return None
 
 
-# 1y of daily closes is plenty for a beta figure and, unlike the scan's own
-# signals, beta barely moves day to day -- so this rides its own long-lived
-# cache, deliberately keyed the same way as streak_analysis.fetch_daily_history()
-# (same symbol + period) so a beta calc and a streak-box look at the same
-# stock share one Yahoo call instead of paying for it twice.
-_BETA_LOOKBACK = "1y"
+# Beta barely moves day to day (unlike the scan's own signals), so it rides
+# its own long-lived cache rather than the scan's short-TTL caches -- keyed
+# per (symbol, period) or (symbol, start, end) so different period choices
+# don't collide, and deliberately in the same format as
+# streak_analysis.fetch_daily_history() for the plain "1y" case so a beta
+# calc and a streak-box look at the same stock over the same window share
+# one Yahoo call instead of paying for it twice.
+BETA_PERIOD_OPTIONS = {
+    "1 Year": "1y",
+    "3 Years": "3y",
+    "5 Years": "5y",
+    "All Time": "max",
+    "Custom Range": "custom",
+}
 _BETA_CACHE_TTL_S = 6 * 3600
 
 
-def _daily_closes_for_beta(yf_symbol: str, retries: int) -> Optional[np.ndarray]:
+def _daily_closes_for_beta(yf_symbol: str, retries: int, period: str = "1y",
+                            start: Optional[str] = None, end: Optional[str] = None) -> Optional[np.ndarray]:
     if is_known_dead(yf_symbol):
         return None
-    cache_key = f"daily_hist_long:{yf_symbol}:{_BETA_LOOKBACK}"
+    if start:
+        cache_key = f"daily_hist_range:{yf_symbol}:{start}:{end or 'now'}"
+    else:
+        cache_key = f"daily_hist_long:{yf_symbol}:{period}"
     data = cache_get(cache_key, _BETA_CACHE_TTL_S)
     if data is None:
-        data = bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period=_BETA_LOOKBACK, interval="1d"),
-                                  retries=retries)
+        if start:
+            data = bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(start=start, end=end, interval="1d"),
+                                      retries=retries)
+        else:
+            data = bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period=period, interval="1d"),
+                                      retries=retries)
         if data is None or data.empty:
             return None
         cache_set(cache_key, data)
@@ -212,13 +228,13 @@ def _daily_closes_for_beta(yf_symbol: str, retries: int) -> Optional[np.ndarray]
         return None
 
 
-def fetch_beta(yf_symbol: str, exchange: str, retries: int = 3) -> Optional[float]:
-    """For modes that don't already carry a year of daily closes lying
-    around (the two intraday screeners only fetch ~5 daily bars for their
-    own scoring) -- fetches a year of daily history for the stock and its
-    home index and hands both to compute_beta(). The two swing screeners
-    already have both series in hand from their own scan and should call
-    compute_beta() directly on those instead of this.
+def fetch_beta(yf_symbol: str, exchange: str, retries: int = 3, period: str = "1y",
+               start: Optional[str] = None, end: Optional[str] = None) -> Optional[float]:
+    """Beta of `yf_symbol` against its home index (see compute_beta()),
+    over a person-chosen window: pass one of BETA_PERIOD_OPTIONS' values
+    ("1y", "3y", "5y", "max") via `period`, or an explicit `start` (and
+    optionally `end`, both "YYYY-MM-DD") for a custom date range -- start
+    takes priority over period when both are given.
 
     Returns None if the exchange has no mapped index or either leg
     couldn't be fetched; never raises.
@@ -226,11 +242,58 @@ def fetch_beta(yf_symbol: str, exchange: str, retries: int = 3) -> Optional[floa
     index_symbol = INDEX_FOR_EXCHANGE.get(exchange)
     if not index_symbol:
         return None
-    stock_closes = _daily_closes_for_beta(yf_symbol, retries)
-    index_closes = _daily_closes_for_beta(index_symbol, retries)
+    stock_closes = _daily_closes_for_beta(yf_symbol, retries, period, start, end)
+    index_closes = _daily_closes_for_beta(index_symbol, retries, period, start, end)
     if stock_closes is None or index_closes is None:
         return None
     return compute_beta(stock_closes, index_closes)
+
+
+def render_beta_period_controls(mode_key: str) -> dict:
+    """Beta Period selector -- 1 Year / 3 Years / 5 Years / All Time /
+    Custom Range -- with a From/To date pair that appears only for Custom
+    Range. Shared by all four screeners so the control looks and behaves
+    identically everywhere.
+
+    Returns kwargs ready to splat into fetch_beta(): {"period", "start",
+    "end"}, plus "label" (the selected option's display name, for the
+    Beta metric's help text).
+    """
+    bp1, bp2, bp3 = st.columns([1, 1, 1])
+    with bp1:
+        label = st.selectbox("Beta Period", list(BETA_PERIOD_OPTIONS.keys()), index=0,
+                              key=sskey(mode_key, "beta_period"))
+    period = BETA_PERIOD_OPTIONS[label]
+    start = end = None
+    valid = True
+    if period == "custom":
+        with bp2:
+            start_date = st.date_input("Beta From", value=date.today() - timedelta(days=365),
+                                        max_value=date.today(), key=sskey(mode_key, "beta_start"))
+        with bp3:
+            end_date = st.date_input("Beta To", value=date.today(), max_value=date.today(),
+                                      key=sskey(mode_key, "beta_end"))
+        if start_date >= end_date:
+            st.warning("⚠️ Beta 'From' date must be before 'To' date — beta is unavailable until this is fixed.")
+            valid = False
+        else:
+            start, end = start_date.isoformat(), end_date.isoformat()
+        period = "1y"  # unused once start is set; kept only as a harmless fallback value
+    return {"period": period, "start": start, "end": end, "label": label, "valid": valid}
+
+
+def apply_beta_to_results(results: list[dict], beta_ctl: dict, retries: int) -> None:
+    """Fills in each result's "beta" key in place, per render_beta_period_controls()'s
+    choice of period/range. Skips fetching (leaves every beta as None)
+    when the control reports an invalid custom range, rather than
+    hammering Yahoo with retries that are doomed to fail on a bad date."""
+    if not beta_ctl.get("valid", True):
+        for r in results:
+            r["beta"] = None
+        return
+    for r in results:
+        r["beta"] = fetch_beta(r["yf_symbol"], r["exchange"], retries=retries,
+                                period=beta_ctl["period"], start=beta_ctl["start"], end=beta_ctl["end"])
 
 
 _HERE = Path(__file__).parent

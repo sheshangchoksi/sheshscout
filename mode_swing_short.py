@@ -351,9 +351,10 @@ def render() -> None:
         if analysis is None:
             return "filtered", None
 
-        # Beta vs. the stock's home index, from the SAME daily closes
-        # already fetched above for scoring -- no extra Yahoo call needed.
-        analysis["beta"] = sc.compute_beta(snap["daily_close"], index_snap["daily_close"]) if index_snap is not None else None
+        # Beta itself is computed on demand in _render_results(), per
+        # whatever Beta Period the person has selected there (1Y/3Y/5Y/All
+        # Time/custom range) -- not baked in at scan time, so changing the
+        # period doesn't require re-running the whole scan.
 
         shares_out = intraday_data.fetch_shares_outstanding(rec["yf_symbol"], retries=rate_cfg["retries"])
         market_cap_cr = (shares_out * analysis["price"] / 1e7) if shares_out else None
@@ -386,7 +387,7 @@ def render() -> None:
     if do_scan or resume_scan:
         sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint, resume_ph)
 
-    _render_results()
+    _render_results(rate_cfg["retries"])
 
     with st.expander("📚 How to Use"):
         h1, h2 = st.columns(2)
@@ -413,7 +414,7 @@ def render() -> None:
     sc.footer("<strong>Swing Short (Sell) Screener</strong> · Past patterns are not a prediction of what happens next.")
 
 
-def _render_results() -> None:
+def _render_results(retries: int) -> None:
     results = get_state(MODE_KEY, "results")
     if not results:
         st.info("👈 Configure and click 'SCAN' to start")
@@ -445,6 +446,9 @@ def _render_results() -> None:
     if not results:
         st.warning("⚠️ No results match the current Market Cap filter.")
         return
+
+    beta_ctl = sc.render_beta_period_controls(MODE_KEY)
+    sc.apply_beta_to_results(results, beta_ctl, retries)
 
     _sort_key = {
         "Score": lambda x: x["score"],
@@ -539,7 +543,7 @@ def _render_results() -> None:
     m7.metric(f"{result.get('lookback_days', '?')}-Day Trend", f"{result['recent_trend']:.2f}%")
     m8.metric("Weekly Trend", f"{result['weekly_trend_pct']:.2f}%" if result.get("weekly_trend_pct") is not None else "—")
     m9.metric("Beta", f"{result['beta']:.2f}" if result.get("beta") is not None else "—",
-              help=f"1-year beta vs {index_label}")
+              help=f"{beta_ctl['label']} beta vs {index_label}")
     m10.metric(f"{index_label} Trend", f"{index_trend_pct:+.2f}%" if index_trend_pct is not None else "—",
                help=f"{index_label}'s own move over the Chart Timeframe selected below ({chart_timeframe})")
 
