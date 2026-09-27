@@ -490,6 +490,19 @@ def _render_results() -> None:
     idx_by_option = {opt: i for i, opt in enumerate(options)}
     selected_option = st.selectbox("Select stock for details", options, key=sskey(MODE_KEY, "detail_select"))
     result = results[idx_by_option[selected_option]]
+    period, interval = _TIMEFRAME_MAP[chart_timeframe]
+
+    # Index's own trend over the SAME custom period the person picked above
+    # (not a fixed lookback like beta's) -- Nifty for NSE, Sensex for BSE --
+    # so the beta reading below means something for whatever timeframe
+    # they're actually looking at.
+    index_label = sc.INDEX_LABEL_FOR_EXCHANGE.get(result.get("exchange"), "Index")
+    index_symbol = sc.INDEX_FOR_EXCHANGE.get(result.get("exchange"))
+    index_trend_pct = None
+    if index_symbol:
+        index_chart_data = intraday_data.fetch_chart_history(index_symbol, period, interval)
+        if index_chart_data is not None and not index_chart_data.empty:
+            index_trend_pct = sc.trend_pct_from_closes(index_chart_data["Close"].values)
 
     st.markdown(f"##### {result['symbol']} — {result['signal_strength']} (Score: {result['score']})")
     sc.render_operator_flag_notice(result)
@@ -498,17 +511,22 @@ def _render_results() -> None:
     m2.metric("Day Range", f"₹{result['low']:.2f} – ₹{result['high']:.2f}")
     m3.metric("Volume", f"{result['volume']:,.0f}", f"vs 5D avg {result.get('avg_volume_5d', 0):,.0f}", delta_color="off")
     m4.metric("Vol Ratio", f"{result['volume_ratio']:.2f}x")
-    m5, m6, m7, m8, m9 = st.columns(5)
+    m5, m6, m7, m8, m9, m10 = st.columns(6)
     m5.metric("RSI", f"{result['rsi']:.1f}")
     m6.metric("ATR", f"₹{result['atr']:.2f}", f"{result['atr_pct']:.2f}% of price", delta_color="off")
     m7.metric("5D Trend", f"{result['recent_trend']:.2f}%")
     m8.metric("Hourly Trend", f"{result['hourly_trend_pct']:.2f}%" if result.get("hourly_trend_pct") is not None else "—")
     m9.metric("Beta", f"{result['beta']:.2f}" if result.get("beta") is not None else "—",
-              help=f"1-year beta vs {'Sensex' if result.get('exchange') == 'BSE' else 'Nifty'}")
+              help=f"1-year beta vs {index_label}")
+    m10.metric(f"{index_label} Trend", f"{index_trend_pct:+.2f}%" if index_trend_pct is not None else "—",
+               help=f"{index_label}'s own move over the Chart Timeframe selected below ({chart_timeframe})")
+
+    relation_note = sc.index_relation_note(index_label, index_trend_pct, result.get("beta"))
+    if relation_note:
+        st.caption(f"📊 {relation_note}")
 
     streak_analysis.render_streak_highlight(result, MODE_KEY)
 
-    period, interval = _TIMEFRAME_MAP[chart_timeframe]
     chart_data = intraday_data.fetch_chart_history(result["yf_symbol"], period, interval)
     trading = get_state(MODE_KEY, "trading_settings", {"stop_loss_pct": 0.5, "target_pct": 2.0, "chart_height": 250})
 

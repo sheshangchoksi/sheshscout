@@ -94,6 +94,62 @@ def session_elapsed_fraction(n_bars: int) -> float:
 # universe CSVs are just symbol+name), so this stays at the broad-market
 # level for now rather than pretending to a sector check it can't do.
 INDEX_FOR_EXCHANGE = {"NSE": "^NSEI", "BSE": "^BSESN"}
+INDEX_LABEL_FOR_EXCHANGE = {"NSE": "Nifty", "BSE": "Sensex"}
+
+
+def trend_pct_from_closes(closes) -> Optional[float]:
+    """Plain first-close-to-last-close % change over whatever series is
+    passed in -- used for the index's own trend over a person-chosen
+    period (a custom timeframe, unlike beta's fixed 1y lookback). Returns
+    None on too-short/degenerate input; never raises."""
+    try:
+        closes = np.asarray(closes, dtype=float)
+        if len(closes) < 2 or not closes[0]:
+            return None
+        pct = (closes[-1] - closes[0]) / closes[0] * 100
+        return float(pct) if np.isfinite(pct) else None
+    except Exception:
+        return None
+
+
+def index_relation_note(index_label: str, index_trend_pct: float, beta: Optional[float]) -> Optional[str]:
+    """Plain-language read of what a stock's beta implies about how it
+    likely moved relative to its home index over THIS SAME period, given
+    the index's own trend -- purely informational context for the
+    person's own judgement, never used for scoring, filtering or sorting.
+
+    The read: a positive index trend with beta < 1 means the index has
+    likely been the more profitable side (the stock typically gains less
+    in such rallies); beta > 1 means the stock has likely out-gained the
+    index. Symmetrically for a negative index trend, beta < 1 means the
+    stock has likely lost less than the index, and beta > 1 means it has
+    likely lost more. A negative beta means the stock has historically
+    tended to move OPPOSITE the index altogether.
+    """
+    if beta is None or index_trend_pct is None:
+        return None
+    if abs(index_trend_pct) < 0.05:
+        return f"{index_label} is roughly flat over this period — beta alone won't tell you much right now."
+
+    direction_up = index_trend_pct > 0
+    dir_word = "up" if direction_up else "down"
+    trend_str = f"{index_label} is {dir_word} {abs(index_trend_pct):.2f}% over this period"
+
+    if beta < 0:
+        return (f"{trend_str}, but this stock's beta is negative ({beta:.2f}) — historically it has tended to "
+                f"move OPPOSITE {index_label}, so it may have moved against this trend rather than with it.")
+
+    verb_index = "gains" if direction_up else "losses"
+    if beta < 1:
+        verb_stock = "gained less" if direction_up else "lost less"
+        return (f"{trend_str}; with beta {beta:.2f} (< 1), this stock has historically {verb_stock} than "
+                f"{index_label} in moves like this — {index_label} would likely have been the more profitable "
+                f"side of the two.")
+    if beta > 1:
+        verb_stock = "gained more" if direction_up else "lost more"
+        return (f"{trend_str}; with beta {beta:.2f} (> 1), this stock has historically {verb_stock} than "
+                f"{index_label}'s own {verb_index} — bigger swings than the index in either direction.")
+    return f"{trend_str}; with beta ≈ 1.00, this stock has historically tracked {index_label} roughly move-for-move."
 
 
 def compute_beta(stock_closes, index_closes) -> Optional[float]:
