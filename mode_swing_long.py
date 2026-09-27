@@ -369,6 +369,7 @@ def render() -> None:
 
         weekly_ctx = swing_data.fetch_weekly_context(rec["yf_symbol"], retries=rate_cfg["retries"])
         index_change_pct = None
+        index_snap = None
         index_symbol = sc.INDEX_FOR_EXCHANGE.get(rec["exchange"])
         if index_symbol:
             index_snap = swing_data.fetch_swing_snapshot(index_symbol, daily_period, retries=rate_cfg["retries"])
@@ -381,6 +382,12 @@ def render() -> None:
         analysis = score_swing_long(snap, params, weekly_ctx, index_change_pct)
         if analysis is None:
             return "filtered", None
+
+        # Beta vs. the stock's home index, from the SAME daily closes
+        # already fetched above for scoring -- no extra Yahoo call needed
+        # (unlike the intraday screeners, which only carry ~5 daily bars
+        # and so fetch a dedicated year of history via sc.fetch_beta()).
+        analysis["beta"] = sc.compute_beta(snap["daily_close"], index_snap["daily_close"]) if index_snap is not None else None
 
         # Shares outstanding doesn't depend on timeframe -- reused straight
         # from intraday_data.py rather than duplicating a second fetcher.
@@ -492,6 +499,7 @@ def _render_results() -> None:
         "Price (₹)": r["price"], "Change %": r["change_pct"], "Score": r["score"],
         "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
         "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
+        "Beta": r.get("beta"),
         "Flag": r.get("operated_flag"),
         "Dist from N-Day Low (%)": r["dist_from_low"], "Dist from Support (%)": r.get("dist_from_support"),
         "Support (₹)": r.get("support_level"), "Resistance (₹)": r.get("resistance_level"),
@@ -523,6 +531,7 @@ def _render_results() -> None:
         "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from N-Day Low (%)": "{:.2f}%", "Dist from Support (%)": "{:.2f}%",
         "Support (₹)": "₹{:.2f}", "Resistance (₹)": "₹{:.2f}", "R:R": "1:{:.2f}",
         "N-Day Trend (%)": "{:+.2f}%", "Weekly Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
+        "Beta": "{:.2f}",
     }, na_rep="—")
     st.dataframe(styled, width="stretch", height=400)
 
@@ -549,11 +558,13 @@ def _render_results() -> None:
     m3.metric("Volume", f"{result['volume']:,.0f}",
               f"vs {result.get('lookback_days', '?')}D avg {result.get('avg_volume_lookback', 0):,.0f}", delta_color="off")
     m4.metric("Vol Ratio", f"{result['volume_ratio']:.2f}x")
-    m5, m6, m7, m8 = st.columns(4)
+    m5, m6, m7, m8, m9 = st.columns(5)
     m5.metric("RSI", f"{result['rsi']:.1f}")
     m6.metric("ATR", f"₹{result['atr']:.2f}", f"{result['atr_pct']:.2f}% of price", delta_color="off")
     m7.metric(f"{result.get('lookback_days', '?')}-Day Trend", f"{result['recent_trend']:.2f}%")
     m8.metric("Weekly Trend", f"{result['weekly_trend_pct']:.2f}%" if result.get("weekly_trend_pct") is not None else "—")
+    m9.metric("Beta", f"{result['beta']:.2f}" if result.get("beta") is not None else "—",
+              help=f"1-year beta vs {'Sensex' if result.get('exchange') == 'BSE' else 'Nifty'}")
 
     streak_analysis.render_streak_highlight(result, MODE_KEY)
 

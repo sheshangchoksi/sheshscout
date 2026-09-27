@@ -347,6 +347,11 @@ def render() -> None:
         analysis["market_cap_cr"] = market_cap_cr
         analysis["market_cap_category"] = sc.market_cap_category(market_cap_cr)
 
+        # 1-year beta vs. the stock's home index (Nifty for NSE, Sensex for
+        # BSE) -- informational only, same footing as market cap; never
+        # affects score, conditions, gating, or sorting.
+        analysis["beta"] = sc.fetch_beta(rec["yf_symbol"], rec["exchange"], retries=rate_cfg["retries"])
+
         # Purely informational "unusual activity" flag -- see
         # sc.assess_operator_risk()'s docstring and score_long's identical
         # comment. Never affects score, conditions, gating, or sorting.
@@ -433,6 +438,7 @@ def _render_results() -> None:
         "Price (₹)": r["price"], "Change %": r["change_pct"], "Score": r["score"],
         "Signal": r["signal_strength"], "Market Cap (₹ Cr)": r.get("market_cap_cr"),
         "Cap": r.get("market_cap_category", "Unknown"), "Volume Ratio": r["volume_ratio"],
+        "Beta": r.get("beta"),
         "Flag": r.get("operated_flag"),
         "Dist from High (%)": r["dist_from_high"], "Dist from Resistance (%)": r.get("dist_from_resistance"),
         "Support (₹)": r.get("support_level"), "Resistance (₹)": r.get("resistance_level"),
@@ -464,6 +470,7 @@ def _render_results() -> None:
         "Market Cap (₹ Cr)": "₹{:,.0f} Cr", "Dist from High (%)": "{:.2f}%", "Dist from Resistance (%)": "{:.2f}%",
         "Support (₹)": "₹{:.2f}", "Resistance (₹)": "₹{:.2f}", "R:R": "1:{:.2f}",
         "5D Trend (%)": "{:+.2f}%", "Hourly Trend (%)": "{:+.2f}%", "RSI": "{:.1f}", "ATR %": "{:.2f}%",
+        "Beta": "{:.2f}",
     }, na_rep="—")
     st.dataframe(styled, width="stretch", height=400)
 
@@ -491,11 +498,13 @@ def _render_results() -> None:
     m2.metric("Day Range", f"₹{result['low']:.2f} – ₹{result['high']:.2f}")
     m3.metric("Volume", f"{result['volume']:,.0f}", f"vs 5D avg {result.get('avg_volume_5d', 0):,.0f}", delta_color="off")
     m4.metric("Vol Ratio", f"{result['volume_ratio']:.2f}x")
-    m5, m6, m7, m8 = st.columns(4)
+    m5, m6, m7, m8, m9 = st.columns(5)
     m5.metric("RSI", f"{result['rsi']:.1f}")
     m6.metric("ATR", f"₹{result['atr']:.2f}", f"{result['atr_pct']:.2f}% of price", delta_color="off")
     m7.metric("5D Trend", f"{result['recent_trend']:.2f}%")
     m8.metric("Hourly Trend", f"{result['hourly_trend_pct']:.2f}%" if result.get("hourly_trend_pct") is not None else "—")
+    m9.metric("Beta", f"{result['beta']:.2f}" if result.get("beta") is not None else "—",
+              help=f"1-year beta vs {'Sensex' if result.get('exchange') == 'BSE' else 'Nifty'}")
 
     streak_analysis.render_streak_highlight(result, MODE_KEY)
 

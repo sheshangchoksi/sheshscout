@@ -95,6 +95,88 @@ def session_elapsed_fraction(n_bars: int) -> float:
 # level for now rather than pretending to a sector check it can't do.
 INDEX_FOR_EXCHANGE = {"NSE": "^NSEI", "BSE": "^BSESN"}
 
+
+def compute_beta(stock_closes, index_closes) -> Optional[float]:
+    """Beta of a stock's daily returns against its home index's -- NSE
+    stocks vs Nifty (^NSEI), BSE stocks vs Sensex (^BSESN), per
+    INDEX_FOR_EXCHANGE -- i.e. Cov(stock returns, index returns) /
+    Var(index returns), over whatever trailing window both close arrays
+    share.
+
+    Aligns on the shorter series' length rather than date-matching: both
+    inputs are plain daily closes, most-recent-last, and occasional single-
+    day NSE/BSE-vs-index calendar mismatches aren't worth the bookkeeping
+    for a rough beta figure. Returns None if there's too little overlapping
+    history (<30 sessions) or the index has ~zero variance to divide by
+    (flat/degenerate data); never raises.
+    """
+    try:
+        stock_closes = np.asarray(stock_closes, dtype=float)
+        index_closes = np.asarray(index_closes, dtype=float)
+        n = min(len(stock_closes), len(index_closes))
+        if n < 30:
+            return None
+        stock_closes = stock_closes[-n:]
+        index_closes = index_closes[-n:]
+        stock_returns = np.diff(stock_closes) / stock_closes[:-1]
+        index_returns = np.diff(index_closes) / index_closes[:-1]
+        index_var = np.var(index_returns, ddof=1)
+        if not np.isfinite(index_var) or index_var <= 1e-12:
+            return None
+        cov = np.cov(stock_returns, index_returns, ddof=1)[0, 1]
+        beta = cov / index_var
+        return float(beta) if np.isfinite(beta) else None
+    except Exception:
+        return None
+
+
+# 1y of daily closes is plenty for a beta figure and, unlike the scan's own
+# signals, beta barely moves day to day -- so this rides its own long-lived
+# cache, deliberately keyed the same way as streak_analysis.fetch_daily_history()
+# (same symbol + period) so a beta calc and a streak-box look at the same
+# stock share one Yahoo call instead of paying for it twice.
+_BETA_LOOKBACK = "1y"
+_BETA_CACHE_TTL_S = 6 * 3600
+
+
+def _daily_closes_for_beta(yf_symbol: str, retries: int) -> Optional[np.ndarray]:
+    if is_known_dead(yf_symbol):
+        return None
+    cache_key = f"daily_hist_long:{yf_symbol}:{_BETA_LOOKBACK}"
+    data = cache_get(cache_key, _BETA_CACHE_TTL_S)
+    if data is None:
+        data = bulletproof_fetch(lambda: yf.Ticker(yf_symbol).history(period=_BETA_LOOKBACK, interval="1d"),
+                                  retries=retries)
+        if data is None or data.empty:
+            return None
+        cache_set(cache_key, data)
+    try:
+        return data["Close"].values.astype(float)
+    except Exception:
+        return None
+
+
+def fetch_beta(yf_symbol: str, exchange: str, retries: int = 3) -> Optional[float]:
+    """For modes that don't already carry a year of daily closes lying
+    around (the two intraday screeners only fetch ~5 daily bars for their
+    own scoring) -- fetches a year of daily history for the stock and its
+    home index and hands both to compute_beta(). The two swing screeners
+    already have both series in hand from their own scan and should call
+    compute_beta() directly on those instead of this.
+
+    Returns None if the exchange has no mapped index or either leg
+    couldn't be fetched; never raises.
+    """
+    index_symbol = INDEX_FOR_EXCHANGE.get(exchange)
+    if not index_symbol:
+        return None
+    stock_closes = _daily_closes_for_beta(yf_symbol, retries)
+    index_closes = _daily_closes_for_beta(index_symbol, retries)
+    if stock_closes is None or index_closes is None:
+        return None
+    return compute_beta(stock_closes, index_closes)
+
+
 _HERE = Path(__file__).parent
 _NSE_CSV = _HERE / "nse_tickers.csv"
 _BSE_CSV = _HERE / "bse_codes.csv"
