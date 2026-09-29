@@ -264,6 +264,7 @@ def render() -> None:
     scan_nse, scan_bse, universe = sc.render_exchange_selector(MODE_KEY)
     stocks_to_scan = sc.render_scan_mode_selector(MODE_KEY, universe)
     rate_cfg = sc.render_rate_limit_controls(MODE_KEY)
+    beta_ctl = sc.render_beta_period_controls(MODE_KEY)
     strict_mode = sc.render_strict_mode_toggle(MODE_KEY)
 
     st.sidebar.markdown("---")
@@ -423,7 +424,7 @@ def render() -> None:
     if do_scan or resume_scan:
         sc.run_scan(MODE_KEY, stocks_to_scan, fetch_and_analyze, rate_cfg, resume_scan, checkpoint, resume_ph)
 
-    _render_results(rate_cfg["retries"])
+    _render_results(rate_cfg["retries"], beta_ctl)
 
     with st.expander("📚 How to Use"):
         h1, h2 = st.columns(2)
@@ -450,7 +451,7 @@ def render() -> None:
     sc.footer("<strong>Swing Long (Buy) Screener</strong> · Past patterns are not a prediction of what happens next.")
 
 
-def _render_results(retries: int) -> None:
+def _render_results(retries: int, beta_ctl: dict) -> None:
     results = get_state(MODE_KEY, "results")
     if not results:
         st.info("👈 Configure and click 'SCAN' to start")
@@ -483,7 +484,6 @@ def _render_results(retries: int) -> None:
         st.warning("⚠️ No results match the current Market Cap filter.")
         return
 
-    beta_ctl = sc.render_beta_period_controls(MODE_KEY)
     sc.apply_beta_to_results(results, beta_ctl, retries)
 
     _sort_key = {

@@ -250,35 +250,33 @@ def fetch_beta(yf_symbol: str, exchange: str, retries: int = 3, period: str = "1
 
 
 def render_beta_period_controls(mode_key: str) -> dict:
-    """Beta Period selector -- 1 Year / 3 Years / 5 Years / All Time /
-    Custom Range -- with a From/To date pair that appears only for Custom
-    Range. Shared by all four screeners so the control looks and behaves
-    identically everywhere.
+    """Sidebar Beta Period selector -- 1 Year / 3 Years / 5 Years / All
+    Time / Custom Range -- with From/To date pickers that appear only for
+    Custom Range. Shared by all four screeners.
 
     Returns kwargs ready to splat into fetch_beta(): {"period", "start",
-    "end"}, plus "label" (the selected option's display name, for the
-    Beta metric's help text).
+    "end"}, plus "label" (display name of the choice) and "valid" (False
+    for an inverted custom range).
     """
-    bp1, bp2, bp3 = st.columns([1, 1, 1])
-    with bp1:
-        label = st.selectbox("Beta Period", list(BETA_PERIOD_OPTIONS.keys()), index=0,
-                              key=sskey(mode_key, "beta_period"))
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📐 Beta Period")
+    label = st.sidebar.selectbox("Beta Period", list(BETA_PERIOD_OPTIONS.keys()), index=0,
+                                  key=sskey(mode_key, "beta_period"),
+                                  help="Lookback used for Beta vs Nifty (NSE) / Sensex (BSE) in the table and cards.")
     period = BETA_PERIOD_OPTIONS[label]
     start = end = None
     valid = True
     if period == "custom":
-        with bp2:
-            start_date = st.date_input("Beta From", value=date.today() - timedelta(days=365),
-                                        max_value=date.today(), key=sskey(mode_key, "beta_start"))
-        with bp3:
-            end_date = st.date_input("Beta To", value=date.today(), max_value=date.today(),
-                                      key=sskey(mode_key, "beta_end"))
+        start_date = st.sidebar.date_input("Beta From", value=date.today() - timedelta(days=365),
+                                            max_value=date.today(), key=sskey(mode_key, "beta_start"))
+        end_date = st.sidebar.date_input("Beta To", value=date.today(), max_value=date.today(),
+                                          key=sskey(mode_key, "beta_end"))
         if start_date >= end_date:
-            st.warning("⚠️ Beta 'From' date must be before 'To' date — beta is unavailable until this is fixed.")
+            st.sidebar.warning("⚠️ 'From' must be before 'To' — beta unavailable until fixed.")
             valid = False
         else:
             start, end = start_date.isoformat(), end_date.isoformat()
-        period = "1y"  # unused once start is set; kept only as a harmless fallback value
+        period = "1y"  # unused once start is set
     return {"period": period, "start": start, "end": end, "label": label, "valid": valid}
 
 
